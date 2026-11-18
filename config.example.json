@@ -1,0 +1,78 @@
+{
+  // HTTP API 网关配置
+  "server": {
+    "listen_addr": ":8080",
+    // 可选：配置一个或多个 API Key（同时支持 Authorization: Bearer <key> 与 x-api-key: <key>）；留空则不鉴权
+    "api_keys": [],
+    "read_header_timeout_seconds": 30,
+    "request_timeout_seconds": 600
+  },
+
+  // ACP (Agent Client Protocol) stdio 子进程配置
+  "acp": {
+    // 启动 ACP 服务的命令与参数，例如：
+    // - Claude Code ACP: "claude-code-acp", args: []
+    // - Gemini CLI ACP:  "gemini", args: ["--experimental-acp"]
+    // - Codex ACP:       "codex-acp", args: []
+    // - OpenCode ACP:    "opencode", args: ["acp"]
+    "command": "gemini",
+    "args": ["--experimental-acp"],
+    "env": {},
+    "cwd": ".",
+    "initialize_timeout_seconds": 30,
+    "session_new_timeout_seconds": 30,
+
+    // ACP session/request_permission 权限回调策略：
+    // - "allow_all"       : 自动批准全部工具权限请求（适合受控环境下的无头 API 服务）
+    // - "allow_read_only" : 仅自动批准 read/search/think/fetch 类请求，拒绝写操作与命令执行
+    // - "deny_all"        : 自动拒绝全部需要审批的请求
+    "permission_policy": "allow_all",
+
+    // 是否向 ACP Agent 暴露客户端宿主机的文件读写与终端执行能力
+    "capabilities": {
+      "enable_fs_read": false,
+      "enable_fs_write": false,
+      "enable_terminal": false,
+      "restrict_to_cwd": true
+    },
+
+    // 创建 ACP Session 时透传给 session/new 的 MCP 服务器列表
+    "mcp_servers": [],
+
+    // 默认对外展示的模型名称及别名映射
+    "default_model": "acp-default",
+    "model_aliases": {
+      // 将客户端传入的模型名映射为特定 ACP 模型 ID；设为空字符串 "" 表示保持 Agent 默认模型不变
+      "gpt-4o": "",
+      "claude-sonnet-4-5": ""
+    },
+    "pass_through_models": true,
+
+    // 是否将 ACP 的 agent_thought_chunk 输出为 OpenAI reasoning_content / Anthropic thinking
+    "expose_thoughts": true
+  },
+
+  // 进程池、预热空闲 Session 池与多轮对话复用配置
+  "pool": {
+    // 常驻 ACP stdio 工作进程数量（单进程内支持多路复用多个并发 Session；异常退出自动重启）
+    "process_count": 1,
+    // 后台始终保持预热就绪（已完成 session/new）的空闲 Session 数量，实现零冷启动延迟响应
+    "idle_pool_size": 3,
+    // 最大并发执行中的请求数（0 表示不限制）
+    "max_active_sessions": 32,
+    // 智能多轮对话复用：按消息历史前缀指纹自动匹配已有 Session 并仅发送增量消息
+    "reuse_conversations": true,
+    // 多轮对话 Session 缓存上限（LRU 淘汰）
+    "max_cached_sessions": 64,
+    // 空闲预热 Session 与多轮缓存 Session 的存活时间（秒）
+    "idle_session_ttl_seconds": 1800,
+    "cached_session_ttl_seconds": 1800,
+    // 单个 ACP 进程累计创建多少个 Session 后平滑轮换进程（0 表示不轮换）
+    "max_sessions_per_process": 0
+  },
+
+  "log": {
+    "level": "info",
+    "format": "text"
+  }
+}

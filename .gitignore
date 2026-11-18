@@ -1,0 +1,19 @@
+# Compiled binaries
+/acp2api
+*.exe
+*.test
+
+# Local configuration (may contain secrets/API keys)
+/config.json
+/config.local.json
+/config.local.jsonc
+
+# Coverage & profiling outputs
+*.out
+coverage.html
+
+# OS / Editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
