@@ -50,11 +50,17 @@ type Client struct {
 	pendingMu sync.Mutex
 	pending   map[string]chan callOutcome
 
+	reverseMu      sync.Mutex
+	reverseCancels map[string]context.CancelFunc
+
 	listenersMu sync.RWMutex
 	listeners   map[string]func(ParsedUpdate)
 
 	initMu     sync.RWMutex
 	initResult InitializeResult
+
+	unsupportedClose atomic.Bool
+	unsupportedFork  atomic.Bool
 
 	stderrMu   sync.Mutex
 	stderrTail []string
@@ -73,15 +79,16 @@ func NewClient(id string, cfg config.ACPConfig, logger *slog.Logger) *Client {
 	l := logger.With("acp_worker", id)
 	procCtx, procCancel := context.WithCancel(context.Background())
 	return &Client{
-		id:         id,
-		cfg:        cfg,
-		logger:     l,
-		host:       NewHostHandler(cfg, l),
-		procCtx:    procCtx,
-		procCancel: procCancel,
-		pending:    make(map[string]chan callOutcome),
-		listeners:  make(map[string]func(ParsedUpdate)),
-		done:       make(chan struct{}),
+		id:             id,
+		cfg:            cfg,
+		logger:         l,
+		host:           NewHostHandlerWithContext(procCtx, cfg, l),
+		procCtx:        procCtx,
+		procCancel:     procCancel,
+		pending:        make(map[string]chan callOutcome),
+		reverseCancels: make(map[string]context.CancelFunc),
+		listeners:      make(map[string]func(ParsedUpdate)),
+		done:           make(chan struct{}),
 	}
 }
 
@@ -111,7 +118,15 @@ func (c *Client) InitResult() InitializeResult {
 	return c.initResult
 }
 
-// Start launches the ACP subprocess via stdio and completes the initialize handshake.
+// SupportsFork reports whether the ACP agent can fork existing sessions.
+func (c *Client) SupportsFork() bool {
+	if c.unsupportedFork.Load() {
+		return false
+	}
+	return c.InitResult().AgentCapabilities.SessionCapabilities.HasFork()
+}
+
+// Start launches the ACP subprocess via stdio, completes initialize, and runs authenticate if configured.
 func (c *Client) Start(ctx context.Context) error {
 	cmd := exec.CommandContext(c.procCtx, c.cfg.Command, c.cfg.Args...)
 	cmd.Dir = c.cfg.Cwd
@@ -161,7 +176,7 @@ func (c *Client) Start(ctx context.Context) error {
 		ClientInfo: ImplementationInfo{
 			Name:    "acp2api",
 			Title:   "ACP to OpenAI/Anthropic API Gateway",
-			Version: "1.0.0",
+			Version: "1.1.0",
 		},
 		ClientCapabilities: ClientCapabilities{
 			FS: FSCapabilities{
@@ -182,25 +197,54 @@ func (c *Client) Start(ctx context.Context) error {
 	c.initResult = initRes
 	c.initMu.Unlock()
 
+	if authID := strings.TrimSpace(c.cfg.AuthMethodID); authID != "" {
+		if err := c.Authenticate(initCtx, authID); err != nil {
+			_ = c.Close()
+			return fmt.Errorf("acp authenticate(%q) failed: %w%s", authID, err, c.formatStderrSuffix())
+		}
+	}
+
 	c.logger.Info("ACP stdio worker initialized",
 		"pid", cmd.Process.Pid,
 		"agent_name", initRes.AgentInfo.Name,
 		"agent_version", initRes.AgentInfo.Version,
 		"protocol_version", initRes.ProtocolVersion,
 		"image_support", initRes.AgentCapabilities.PromptCapabilities.Image,
+		"audio_support", initRes.AgentCapabilities.PromptCapabilities.Audio,
+		"embedded_context", initRes.AgentCapabilities.PromptCapabilities.EmbeddedContext,
 	)
 	return nil
 }
 
+// Authenticate invokes the ACP authenticate method with the selected methodId.
+func (c *Client) Authenticate(ctx context.Context, methodID string) error {
+	var ignored json.RawMessage
+	return c.call(ctx, "authenticate", AuthenticateParams{MethodID: methodID}, &ignored)
+}
+
+func (c *Client) compatibleMCPServers() []config.MCPServerConfig {
+	caps := c.InitResult().AgentCapabilities.MCPCapabilities
+	out := make([]config.MCPServerConfig, 0, len(c.cfg.MCPServers))
+	for _, m := range c.cfg.MCPServers {
+		t := strings.ToLower(strings.TrimSpace(m.Type))
+		if t == "http" && !caps.HTTP {
+			c.logger.Warn("skipping HTTP MCP server because agent did not advertise mcpCapabilities.http", "mcp_name", m.Name)
+			continue
+		}
+		if t == "sse" && !caps.SSE {
+			c.logger.Warn("skipping SSE MCP server because agent did not advertise mcpCapabilities.sse", "mcp_name", m.Name)
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
 // NewSession invokes session/new to create a fresh conversation session on this worker.
 func (c *Client) NewSession(ctx context.Context) (SessionNewResult, error) {
-	mcpServers := c.cfg.MCPServers
-	if mcpServers == nil {
-		mcpServers = []config.MCPServerConfig{}
-	}
 	params := SessionNewParams{
 		Cwd:        c.cfg.Cwd,
-		MCPServers: mcpServers,
+		MCPServers: c.compatibleMCPServers(),
 	}
 	var res SessionNewResult
 	if err := c.call(ctx, "session/new", params, &res); err != nil {
@@ -209,24 +253,138 @@ func (c *Client) NewSession(ctx context.Context) (SessionNewResult, error) {
 	if strings.TrimSpace(res.SessionID) == "" {
 		return SessionNewResult{}, errors.New("acp session/new returned empty sessionId")
 	}
+	if defMode := strings.TrimSpace(c.cfg.DefaultMode); defMode != "" {
+		if updated, err := c.SetSessionMode(ctx, res.SessionID, defMode, res); err == nil && len(updated) > 0 {
+			res.ConfigOptions = updated
+		}
+	}
 	return res, nil
 }
 
-// SetSessionModel switches the model on an existing ACP session using session/set_config_option
-// when advertised, falling back to session/set_model.
-func (c *Client) SetSessionModel(ctx context.Context, sessionID, modelID string, meta SessionNewResult) error {
-	if strings.TrimSpace(modelID) == "" {
+// LoadSession invokes session/load to restore a persisted ACP session (requires agent loadSession capability).
+func (c *Client) LoadSession(ctx context.Context, sessionID string, onReplayUpdate func(ParsedUpdate)) (SessionNewResult, error) {
+	if onReplayUpdate != nil {
+		c.listenersMu.Lock()
+		c.listeners[sessionID] = onReplayUpdate
+		c.listenersMu.Unlock()
+		defer func() {
+			c.listenersMu.Lock()
+			delete(c.listeners, sessionID)
+			c.listenersMu.Unlock()
+		}()
+	}
+
+	params := SessionLoadParams{
+		SessionID:  sessionID,
+		Cwd:        c.cfg.Cwd,
+		MCPServers: c.compatibleMCPServers(),
+	}
+	var res SessionNewResult
+	if err := c.call(ctx, "session/load", params, &res); err != nil {
+		return SessionNewResult{}, fmt.Errorf("acp session/load failed: %w", err)
+	}
+	if res.SessionID == "" {
+		res.SessionID = sessionID
+	}
+	return res, nil
+}
+
+// ResumeSession invokes session/resume to re-attach to an existing session without history replay.
+func (c *Client) ResumeSession(ctx context.Context, sessionID string) (SessionNewResult, error) {
+	params := SessionResumeParams{
+		SessionID:  sessionID,
+		Cwd:        c.cfg.Cwd,
+		MCPServers: c.compatibleMCPServers(),
+	}
+	var res SessionNewResult
+	if err := c.call(ctx, "session/resume", params, &res); err != nil {
+		return SessionNewResult{}, fmt.Errorf("acp session/resume failed: %w", err)
+	}
+	if res.SessionID == "" {
+		res.SessionID = sessionID
+	}
+	return res, nil
+}
+
+// ForkSession invokes session/fork to clone an existing session's state into a new independent session ID.
+func (c *Client) ForkSession(ctx context.Context, sessionID string) (SessionNewResult, error) {
+	if c.unsupportedFork.Load() {
+		return SessionNewResult{}, &RPCError{Code: rpcErrMethodNotFound, Message: "session/fork not supported"}
+	}
+	params := SessionForkParams{
+		SessionID:  sessionID,
+		Cwd:        c.cfg.Cwd,
+		MCPServers: c.compatibleMCPServers(),
+	}
+	var res SessionNewResult
+	if err := c.call(ctx, "session/fork", params, &res); err != nil {
+		var rpcErr *RPCError
+		if errors.As(err, &rpcErr) && rpcErr.Code == rpcErrMethodNotFound {
+			c.unsupportedFork.Store(true)
+		}
+		return SessionNewResult{}, err
+	}
+	if strings.TrimSpace(res.SessionID) == "" {
+		return SessionNewResult{}, errors.New("acp session/fork returned empty sessionId")
+	}
+	return res, nil
+}
+
+// ListSessions invokes session/list to enumerate sessions known to the ACP agent.
+func (c *Client) ListSessions(ctx context.Context, cursor string) (SessionListResult, error) {
+	params := SessionListParams{
+		Cwd:    c.cfg.Cwd,
+		Cursor: cursor,
+	}
+	var res SessionListResult
+	if err := c.call(ctx, "session/list", params, &res); err != nil {
+		return SessionListResult{}, err
+	}
+	return res, nil
+}
+
+// CloseSession invokes session/close so the ACP agent can release memory associated with a retired session.
+// If the agent does not implement session/close (-32601), it caches that fact and becomes a silent no-op.
+func (c *Client) CloseSession(ctx context.Context, sessionID string) error {
+	if strings.TrimSpace(sessionID) == "" || !c.Alive() || c.unsupportedClose.Load() {
 		return nil
 	}
+	var ignored json.RawMessage
+	err := c.call(ctx, "session/close", SessionCloseParams{SessionID: sessionID}, &ignored)
+	if err != nil {
+		var rpcErr *RPCError
+		if errors.As(err, &rpcErr) && rpcErr.Code == rpcErrMethodNotFound {
+			c.unsupportedClose.Store(true)
+			return nil
+		}
+	}
+	return err
+}
+
+// SetConfigOption updates a session configuration option via session/set_config_option and returns
+// the updated ConfigOptions list if returned by the agent.
+func (c *Client) SetConfigOption(ctx context.Context, sessionID, configID string, value any) ([]SessionConfigOption, error) {
+	params := SetConfigOptionParams{
+		SessionID: sessionID,
+		ConfigID:  configID,
+		Value:     value,
+	}
+	var res SetConfigOptionResult
+	if err := c.call(ctx, "session/set_config_option", params, &res); err != nil {
+		return nil, err
+	}
+	return res.ConfigOptions, nil
+}
+
+// SetSessionModel switches the model on an existing ACP session using session/set_config_option
+// when advertised, falling back to session/set_model. Returns any updated ConfigOptions.
+func (c *Client) SetSessionModel(ctx context.Context, sessionID, modelID string, meta SessionNewResult) ([]SessionConfigOption, error) {
+	if strings.TrimSpace(modelID) == "" {
+		return nil, nil
+	}
 	for _, opt := range meta.ConfigOptions {
-		if opt.Category == "model" || opt.ID == "model" {
-			params := SetConfigOptionParams{
-				SessionID: sessionID,
-				ConfigID:  opt.ID,
-				Value:     modelID,
-			}
-			var ignored json.RawMessage
-			return c.call(ctx, "session/set_config_option", params, &ignored)
+		if strings.EqualFold(opt.Category, "model") || strings.EqualFold(opt.ID, "model") {
+			return c.SetConfigOption(ctx, sessionID, opt.ID, modelID)
 		}
 	}
 	params := SetModelParams{
@@ -234,7 +392,32 @@ func (c *Client) SetSessionModel(ctx context.Context, sessionID, modelID string,
 		ModelID:   modelID,
 	}
 	var ignored json.RawMessage
-	return c.call(ctx, "session/set_model", params, &ignored)
+	if err := c.call(ctx, "session/set_model", params, &ignored); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+// SetSessionMode switches the operational mode of an ACP session using session/set_config_option
+// (if a category=="mode" configOption is present) or session/set_mode.
+func (c *Client) SetSessionMode(ctx context.Context, sessionID, modeID string, meta SessionNewResult) ([]SessionConfigOption, error) {
+	if strings.TrimSpace(modeID) == "" {
+		return nil, nil
+	}
+	for _, opt := range meta.ConfigOptions {
+		if strings.EqualFold(opt.Category, "mode") || strings.EqualFold(opt.ID, "mode") {
+			return c.SetConfigOption(ctx, sessionID, opt.ID, modeID)
+		}
+	}
+	params := SetSessionModeParams{
+		SessionID: sessionID,
+		ModeID:    modeID,
+	}
+	var ignored json.RawMessage
+	if err := c.call(ctx, "session/set_mode", params, &ignored); err != nil {
+		return nil, err
+	}
+	return nil, nil
 }
 
 // Prompt executes a user turn on sessionID, streaming session/update events to onUpdate.
@@ -243,6 +426,7 @@ func (c *Client) Prompt(
 	ctx context.Context,
 	sessionID string,
 	blocks []ContentBlock,
+	meta map[string]any,
 	onUpdate func(ParsedUpdate),
 ) (SessionPromptResult, bool, error) {
 	if onUpdate != nil {
@@ -281,6 +465,7 @@ func (c *Client) Prompt(
 		Params: SessionPromptParams{
 			SessionID: sessionID,
 			Prompt:    blocks,
+			Meta:      meta,
 		},
 	}
 	if err := c.writeJSONLine(req); err != nil {
@@ -304,7 +489,6 @@ func (c *Client) Prompt(
 		return res, false, nil
 
 	case <-ctx.Done():
-		// Notify ACP agent immediately to cancel in-flight turn.
 		_ = c.CancelSession(sessionID)
 		timer := time.NewTimer(cancelGracePeriod)
 		defer timer.Stop()
@@ -341,7 +525,6 @@ func (c *Client) Close() error {
 		}
 		c.writeMu.Unlock()
 
-		// Give the subprocess a brief moment to exit cleanly on EOF before killing.
 		if c.cmd != nil && c.cmd.Process != nil {
 			select {
 			case <-c.done:
@@ -394,7 +577,7 @@ func (c *Client) call(ctx context.Context, method string, params any, out any) e
 		if outcome.rpcErr != nil {
 			return outcome.rpcErr
 		}
-		if out != nil && len(outcome.result) > 0 {
+		if out != nil && len(outcome.result) > 0 && string(bytes.TrimSpace(outcome.result)) != "null" {
 			if err := json.Unmarshal(outcome.result, out); err != nil {
 				return fmt.Errorf("decode %s result: %w", method, err)
 			}
@@ -412,7 +595,6 @@ func (c *Client) writeJSONLine(v any) error {
 	if err != nil {
 		return fmt.Errorf("marshal json-rpc message: %w", err)
 	}
-	// Guarantee no embedded newline violates ACP stdio line framing.
 	payload = bytes.ReplaceAll(payload, []byte{'\n'}, []byte{' '})
 	payload = append(payload, '\n')
 
@@ -445,12 +627,29 @@ func (c *Client) handleStdoutLine(line []byte) {
 	if len(line) == 0 {
 		return
 	}
+	// Support JSON-RPC 2.0 batch arrays ([...]) as well as single objects ({...}).
+	if line[0] == '[' {
+		var batch []json.RawMessage
+		if err := json.Unmarshal(line, &batch); err == nil {
+			for _, item := range batch {
+				c.handleSingleEnvelope(bytes.TrimSpace(item))
+			}
+			return
+		}
+	}
 	if line[0] != '{' {
 		c.logger.Debug("ignoring non-JSON line on ACP stdout", "line", string(line))
 		return
 	}
+	c.handleSingleEnvelope(line)
+}
+
+func (c *Client) handleSingleEnvelope(raw []byte) {
+	if len(raw) == 0 || raw[0] != '{' {
+		return
+	}
 	var env rpcEnvelope
-	if err := json.Unmarshal(line, &env); err != nil {
+	if err := json.Unmarshal(raw, &env); err != nil {
 		c.logger.Warn("invalid JSON on ACP stdout", "error", err)
 		return
 	}
@@ -460,22 +659,22 @@ func (c *Client) handleStdoutLine(line []byte) {
 
 	switch {
 	case hasMethod && hasID:
-		// Reverse request from Agent -> Client; handle in goroutine so stdout reader never blocks.
 		idCopy := append(json.RawMessage(nil), env.ID...)
 		paramsCopy := append(json.RawMessage(nil), env.Params...)
 		method := env.Method
 		go c.dispatchReverseRequest(idCopy, method, paramsCopy)
 
 	case hasMethod && !hasID:
-		// Notification from Agent -> Client.
-		if env.Method == "session/update" {
+		switch env.Method {
+		case "session/update":
 			c.dispatchSessionUpdate(env.Params)
-		} else {
+		case "$/cancelRequest", "$cancelRequest":
+			c.handleCancelReverseRequest(env.Params)
+		default:
 			c.logger.Debug("received ACP notification", "method", env.Method)
 		}
 
 	case !hasMethod && hasID:
-		// Response to a Client -> Agent request.
 		idKey := normalizeRPCID(env.ID)
 		c.pendingMu.Lock()
 		ch, ok := c.pending[idKey]
@@ -492,8 +691,40 @@ func (c *Client) handleStdoutLine(line []byte) {
 	}
 }
 
+func (c *Client) handleCancelReverseRequest(raw json.RawMessage) {
+	var p CancelRequestParams
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return
+	}
+	idKey := normalizeRPCID(p.ID)
+	c.reverseMu.Lock()
+	cancelFn, ok := c.reverseCancels[idKey]
+	c.reverseMu.Unlock()
+	if ok && cancelFn != nil {
+		cancelFn()
+	}
+}
+
 func (c *Client) dispatchReverseRequest(id json.RawMessage, method string, params json.RawMessage) {
-	res, rpcErr := c.host.Handle(c.procCtx, method, params)
+	idKey := normalizeRPCID(id)
+	reqCtx, cancel := context.WithCancel(c.procCtx)
+	c.reverseMu.Lock()
+	c.reverseCancels[idKey] = cancel
+	c.reverseMu.Unlock()
+
+	defer func() {
+		cancel()
+		c.reverseMu.Lock()
+		delete(c.reverseCancels, idKey)
+		c.reverseMu.Unlock()
+	}()
+
+	if method == "$/ping" || method == "ping" {
+		_ = c.writeJSONLine(rpcResponse{JSONRPC: "2.0", ID: id, Result: map[string]any{}})
+		return
+	}
+
+	res, rpcErr := c.host.Handle(reqCtx, method, params)
 	resp := rpcResponse{
 		JSONRPC: "2.0",
 		ID:      id,

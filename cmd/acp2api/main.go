@@ -68,6 +68,10 @@ Flags:
 		enableFSRead       = fs.Bool("enable-fs-read", false, "Expose fs/read_text_file capability to ACP agent")
 		enableFSWrite      = fs.Bool("enable-fs-write", false, "Expose fs/write_text_file capability to ACP agent")
 		enableTerminal     = fs.Bool("enable-terminal", false, "Expose terminal/* capabilities to ACP agent")
+		authMethod         = fs.String("auth-method", "", "Optional ACP authenticate methodId to invoke after initialize")
+		defaultMode        = fs.String("default-mode", "", "Optional default ACP session modeId")
+		thinkingFallback   = fs.String("thinking-fallback", "", "Fallback when ACP thinking level is unavailable: auto, prompt_hint, ignore, strict_error")
+		thinkingConfigID   = fs.String("thinking-config-id", "", "Optional explicit ACP configId override for thinking/reasoning effort")
 		defaultModel       = fs.String("default-model", "", "Default model ID reported on /v1/models")
 		logLevel           = fs.String("log-level", "", "Log level: debug, info, warn, error")
 		logFormat          = fs.String("log-format", "", "Log format: text, json")
@@ -149,6 +153,18 @@ Flags:
 	}
 	if *enableTerminal {
 		cfg.ACP.Capabilities.EnableTerminal = true
+	}
+	if *authMethod != "" {
+		cfg.ACP.AuthMethodID = *authMethod
+	}
+	if *defaultMode != "" {
+		cfg.ACP.DefaultMode = *defaultMode
+	}
+	if *thinkingFallback != "" {
+		cfg.ACP.Thinking.FallbackStrategy = config.ThinkingFallbackStrategy(*thinkingFallback)
+	}
+	if *thinkingConfigID != "" {
+		cfg.ACP.Thinking.OverrideConfigID = *thinkingConfigID
 	}
 	if *defaultModel != "" {
 		cfg.ACP.DefaultModel = *defaultModel

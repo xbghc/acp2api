@@ -8,9 +8,14 @@
 
 ## 核心特性
 
-- **标准 `stdio` ACP v1 协议支持**
-  - 自动拉起 ACP 子进程并完成 JSON-RPC 2.0 `initialize` 握手、`session/new` 会话创建、`session/prompt` 流式推理、`session/cancel` 中断与 `session/set_config_option` / `session/set_model` 模型切换。
-  - 完整支持 Agent 反向回调：可配置权限审批策略（`allow_all` / `allow_read_only` / `deny_all`）以及可选的本地安全沙箱文件读写（`fs/*`）和终端执行（`terminal/*`）。
+- **完整 `stdio` ACP 协议支持**
+  - **连接与认证**：自动完成 `initialize` 能力协商、可选 `authenticate` 认证握手、JSON-RPC 2.0 批量帧（Batch）与 `$/cancelRequest` 反向请求取消。
+  - **全会话生命周期**：支持 `session/new`、`session/load`（历史回放）、`session/resume`、`session/fork`（并发会话原生分叉）、`session/list`、`session/close`（淘汰会话主动释放 Agent 内存）、`session/prompt`、`session/cancel`、`session/set_config_option`、`session/set_model`、`session/set_mode`。
+  - **多模态与内嵌资源**：支持 `text`、`image`、`audio`（音频输入）、`resource`（文档/PDF 内嵌上下文）与 `resource_link`，并根据 Agent 声明的 `promptCapabilities` 自动优雅降级；MCP 配置完整支持 `stdio`、`http`、`sse` 三种传输协议。
+  - **实时状态同步与宿主回调**：动态同步 `config_option_update`、`current_mode_update`、`usage_update` 等通知；支持 `allow_all` / `allow_read_only` / `deny_all` 权限审批回调，以及带目录沙箱保护的 `fs/*` 与进程组级 `terminal/*` 终端管理。
+- **Thinking Level 多级探测与非标降级引擎**
+  - 兼容 OpenAI `reasoning_effort`、`/v1/responses` `reasoning.effort`、模型后缀（如 `model:high`、`model(xhigh)`）以及 Anthropic `thinking`（`enabled`/`adaptive`/`disabled` + `budget_tokens`）与 `output_config.effort`。
+  - 针对不按标准 `category: "thought_level"` 返回配置项的 ACP 服务，内置 **6 层渐进式解析与输出兜底**：标准 `thought_level` -> 启发式 `configOptions`（模糊 ID/布尔开关/数值预算/档位枚举）-> 模型变体（`<model>-high`/`-thinking`）与 `modes` -> `override_config_id` 乐观调用 -> `_meta` 扩展透传 / `<thinking_guidance>` 提示词引导 / 静默降级 -> 输出侧自动提取内联 `<think>...</think>` 为标准思考流。
 - **空闲 Session 预热池 + 智能多轮对话复用**
   - **预热池（Zero-Latency Warmup）**：启动时及每次消费后自动在后台预建指定数量（`idle_pool_size`）的空闲 Session，新请求到达时直接命中已就绪 Session，消除 `session/new` 冷启动耗时。
   - **智能多轮增量复用**：通过规范化消息前缀 SHA-256 指纹自动识别多轮对话与工具回调轮次，命中原 ACP Session 时**仅发送新增消息增量**；当发生对话分支（重新生成/修改历史消息）或并发分叉时自动回退到空闲预热池并重放上下文，零串话风险。

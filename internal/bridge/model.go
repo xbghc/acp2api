@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"strings"
 	"unicode/utf8"
+
+	"acp2api/internal/acp"
 )
 
 type PartKind string
@@ -13,6 +15,8 @@ type PartKind string
 const (
 	PartText       PartKind = "text"
 	PartImage      PartKind = "image"
+	PartAudio      PartKind = "audio"
+	PartResource   PartKind = "resource"
 	PartThinking   PartKind = "thinking"
 	PartToolCall   PartKind = "tool_call"
 	PartToolResult PartKind = "tool_result"
@@ -24,13 +28,28 @@ type ImagePayload struct {
 	URI      string `json:"uri,omitempty"`
 }
 
+type AudioPayload struct {
+	MimeType string `json:"mime_type"`
+	Data     string `json:"data"` // base64-encoded audio bytes
+}
+
+type ResourcePayload struct {
+	URI      string `json:"uri"`
+	Name     string `json:"name,omitempty"`
+	MimeType string `json:"mime_type,omitempty"`
+	Text     string `json:"text,omitempty"`
+	Blob     string `json:"blob,omitempty"` // base64-encoded binary content (e.g. PDF)
+}
+
 type ContentPart struct {
-	Kind       PartKind       `json:"kind"`
-	Text       string         `json:"text,omitempty"`
-	Image      *ImagePayload  `json:"image,omitempty"`
-	Thinking   string         `json:"thinking,omitempty"`
-	ToolCall   *ToolCallValue `json:"tool_call,omitempty"`
-	ToolResult *ToolResultVal `json:"tool_result,omitempty"`
+	Kind       PartKind         `json:"kind"`
+	Text       string           `json:"text,omitempty"`
+	Image      *ImagePayload    `json:"image,omitempty"`
+	Audio      *AudioPayload    `json:"audio,omitempty"`
+	Resource   *ResourcePayload `json:"resource,omitempty"`
+	Thinking   string           `json:"thinking,omitempty"`
+	ToolCall   *ToolCallValue   `json:"tool_call,omitempty"`
+	ToolResult *ToolResultVal   `json:"tool_result,omitempty"`
 }
 
 type ToolCallValue struct {
@@ -65,14 +84,17 @@ type ToolChoiceSpec struct {
 
 // UnifiedRequest is the normalized representation of an incoming OpenAI or Anthropic chat request.
 type UnifiedRequest struct {
-	Model         string
-	SessionHint   string
-	System        string
-	Messages      []UnifiedMessage
-	Tools         []ToolDefinition
-	ToolChoice    ToolChoiceSpec
-	Stream        bool
-	StopSequences []string
+	Model           string
+	SessionHint     string
+	ResumeSessionID string
+	Mode            string
+	Thinking        acp.DesiredThinking
+	System          string
+	Messages        []UnifiedMessage
+	Tools           []ToolDefinition
+	ToolChoice      ToolChoiceSpec
+	Stream          bool
+	StopSequences   []string
 }
 
 // StreamEventKind identifies normalized events emitted during a turn execution.
@@ -93,16 +115,17 @@ type StreamEvent struct {
 
 // TurnResponse holds the completed assistant turn output and token usage.
 type TurnResponse struct {
-	Model         string
-	SessionID     string
-	SessionReused bool
-	Thinking      string
-	Text          string
-	ToolCalls     []ToolCallValue
-	StopReason    string // "end_turn", "tool_calls", "max_tokens", "stop_sequence", "cancelled"
-	StopSequence  string
-	InputTokens   int
-	OutputTokens  int
+	Model            string
+	SessionID        string
+	SessionReused    bool
+	ThinkingStrategy string
+	Thinking         string
+	Text             string
+	ToolCalls        []ToolCallValue
+	StopReason       string // "end_turn", "tool_calls", "max_tokens", "stop_sequence", "cancelled"
+	StopSequence     string
+	InputTokens      int
+	OutputTokens     int
 }
 
 // AssistantMessage converts a completed TurnResponse into a UnifiedMessage for conversation history caching.
@@ -170,6 +193,16 @@ func ComputeConversationHash(acpModel string, system string, tools []ToolDefinit
 					imgHash := sha256.Sum256([]byte(p.Image.MimeType + "|" + p.Image.URI + "|" + p.Image.Data))
 					writeField("part_img", hex.EncodeToString(imgHash[:]))
 				}
+			case PartAudio:
+				if p.Audio != nil {
+					audHash := sha256.Sum256([]byte(p.Audio.MimeType + "|" + p.Audio.Data))
+					writeField("part_aud", hex.EncodeToString(audHash[:]))
+				}
+			case PartResource:
+				if p.Resource != nil {
+					resHash := sha256.Sum256([]byte(p.Resource.URI + "|" + p.Resource.MimeType + "|" + p.Resource.Text + "|" + p.Resource.Blob))
+					writeField("part_res", hex.EncodeToString(resHash[:]))
+				}
 			case PartToolCall:
 				if p.ToolCall != nil {
 					writeField("part_tc", p.ToolCall.ID+"|"+p.ToolCall.Name+"|"+compactJSONString([]byte(p.ToolCall.Arguments)))
@@ -189,8 +222,6 @@ func ComputeConversationHash(acpModel string, system string, tools []ToolDefinit
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// normalizeMessagesForHash merges adjacent tool-result messages into canonical order so OpenAI ("role":"tool" per call)
-// and Anthropic ("role":"user" with multiple tool_result blocks) hash consistently within their own flows.
 func normalizeMessagesForHash(msgs []UnifiedMessage) []UnifiedMessage {
 	out := make([]UnifiedMessage, 0, len(msgs))
 	for _, m := range msgs {
@@ -199,13 +230,11 @@ func normalizeMessagesForHash(msgs []UnifiedMessage) []UnifiedMessage {
 			role = "system"
 		}
 		if role == "tool" {
-			// Normalize tool results into canonical "tool" role entries, coalescing adjacent tool messages.
 			if len(out) > 0 && out[len(out)-1].Role == "tool" {
 				out[len(out)-1].Parts = append(out[len(out)-1].Parts, m.Parts...)
 				continue
 			}
 		}
-		// Check if a "user" message contains exclusively PartToolResult (Anthropic style) -> normalize role to "tool".
 		if role == "user" && len(m.Parts) > 0 && allToolResults(m.Parts) {
 			if len(out) > 0 && out[len(out)-1].Role == "tool" {
 				out[len(out)-1].Parts = append(out[len(out)-1].Parts, m.Parts...)
@@ -246,7 +275,6 @@ func compactJSONString(raw []byte) string {
 	return string(norm)
 }
 
-// EstimateTextTokens estimates LLM token count for UTF-8 text without external tokenizer dependencies.
 func EstimateTextTokens(s string) int {
 	if s == "" {
 		return 0
@@ -260,7 +288,6 @@ func EstimateTextTokens(s string) int {
 			nonASCIIRunes++
 		}
 	}
-	// Rough empirical approximation: ~4 ASCII chars/token, ~1.5 non-ASCII (CJK) runes/token.
 	est := (asciiChars+3)/4 + (nonASCIIRunes*2+2)/3
 	if est < 1 {
 		est = 1
@@ -268,14 +295,13 @@ func EstimateTextTokens(s string) int {
 	return est
 }
 
-// EstimateRequestTokens estimates input token usage for a UnifiedRequest.
 func EstimateRequestTokens(req *UnifiedRequest) int {
 	total := EstimateTextTokens(req.System)
 	for _, t := range req.Tools {
 		total += EstimateTextTokens(t.Name) + EstimateTextTokens(t.Description) + EstimateTextTokens(string(t.Parameters)) + 8
 	}
 	for _, m := range req.Messages {
-		total += 4 // per-message framing overhead
+		total += 4
 		for _, p := range m.Parts {
 			switch p.Kind {
 			case PartText:
@@ -284,6 +310,16 @@ func EstimateRequestTokens(req *UnifiedRequest) int {
 				total += EstimateTextTokens(p.Thinking)
 			case PartImage:
 				total += 256
+			case PartAudio:
+				total += 300
+			case PartResource:
+				if p.Resource != nil {
+					if p.Resource.Text != "" {
+						total += EstimateTextTokens(p.Resource.Text)
+					} else {
+						total += 512
+					}
+				}
 			case PartToolCall:
 				if p.ToolCall != nil {
 					total += EstimateTextTokens(p.ToolCall.Name) + EstimateTextTokens(p.ToolCall.Arguments) + 8

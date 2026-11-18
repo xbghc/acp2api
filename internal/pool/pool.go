@@ -28,8 +28,9 @@ type Pool struct {
 	mu               sync.Mutex
 	workers          []*acpWorker
 	idleSessions     []*ManagedSession
-	cachedSessions   []*ManagedSession // ordered oldest -> newest (LRU at index 0)
-	discoveredModels map[string]string // modelId -> name
+	cachedSessions   []*ManagedSession          // ordered oldest -> newest (LRU at index 0)
+	inFlightByHash   map[string]*ManagedSession // currently checked-out sessions eligible for native session/fork
+	discoveredModels map[string]string          // modelId -> name
 	warmingCount     int
 	closed           bool
 	workerSeq        int
@@ -42,6 +43,7 @@ type Pool struct {
 	totalRequests    atomic.Int64
 	idlePoolHits     atomic.Int64
 	conversationHits atomic.Int64
+	sessionForkHits  atomic.Int64
 	coldCreations    atomic.Int64
 	workerRestarts   atomic.Int64
 }
@@ -61,6 +63,7 @@ func New(cfg config.Config, logger *slog.Logger) *Pool {
 		poolCtx:          ctx,
 		poolStop:         cancel,
 		activeSem:        sem,
+		inFlightByHash:   make(map[string]*ManagedSession),
 		discoveredModels: make(map[string]string),
 		replenishCh:      make(chan struct{}, 1),
 	}
@@ -115,7 +118,6 @@ func (p *Pool) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start any ACP stdio worker: %w", firstErr)
 	}
 
-	// Pre-warm initial idle sessions synchronously (bounded by SessionNewTimeout) so first requests are instant.
 	targetIdle := p.cfg.Pool.IdlePoolSize
 	if targetIdle > 0 {
 		warmCtx, cancel := context.WithTimeout(ctx, p.cfg.SessionNewTimeout())
@@ -136,6 +138,8 @@ func (p *Pool) Start(ctx context.Context) error {
 				p.mu.Unlock()
 				if err != nil {
 					p.logger.Warn("initial idle session warmup failed", "error", err)
+				} else if p.closed {
+					p.retireSession(sess)
 				}
 			}()
 		}
@@ -168,6 +172,7 @@ func (p *Pool) Close() error {
 	workers := append([]*acpWorker(nil), p.workers...)
 	p.idleSessions = nil
 	p.cachedSessions = nil
+	p.inFlightByHash = make(map[string]*ManagedSession)
 	p.mu.Unlock()
 
 	p.poolStop()
@@ -207,6 +212,7 @@ func (p *Pool) Stats() Stats {
 		TotalRequests:       p.totalRequests.Load(),
 		IdlePoolHits:        p.idlePoolHits.Load(),
 		ConversationHits:    p.conversationHits.Load(),
+		SessionForkHits:     p.sessionForkHits.Load(),
 		ColdCreations:       p.coldCreations.Load(),
 		WorkerRestarts:      p.workerRestarts.Load(),
 	}
@@ -246,8 +252,7 @@ func (p *Pool) AvailableModels() []string {
 	return out
 }
 
-// ExecuteTurn runs a single chat/messages API request against a reused or pre-warmed ACP session.
-// If onEvent is non-nil, normalized StreamEvents are delivered in real time as chunks arrive.
+// ExecuteTurn runs a single chat/messages API request against a reused, forked, resumed, or pre-warmed ACP session.
 func (p *Pool) ExecuteTurn(
 	ctx context.Context,
 	req *bridge.UnifiedRequest,
@@ -264,7 +269,17 @@ func (p *Pool) ExecuteTurn(
 		}
 	}
 
-	targetACPModel, displayModel := p.cfg.ResolveModel(req.Model)
+	cleanModel, suffixEffort := p.cfg.SplitModelThinkingSuffix(req.Model)
+	targetACPModel, displayModel := p.cfg.ResolveModel(cleanModel)
+	if strings.TrimSpace(req.Model) != "" {
+		displayModel = strings.TrimSpace(req.Model)
+	}
+
+	effectiveThinking := req.Thinking
+	if !effectiveThinking.Specified && suffixEffort != "" {
+		effectiveThinking = acp.NormalizeThinkingIntent(nil, suffixEffort, 0)
+	}
+
 	activeTools := req.Tools
 	if req.ToolChoice.Mode == "none" {
 		activeTools = nil
@@ -275,6 +290,20 @@ func (p *Pool) ExecuteTurn(
 		return nil, err
 	}
 
+	priorHash := sess.HistoryHash
+	if priorHash != "" {
+		p.mu.Lock()
+		p.inFlightByHash[priorHash] = sess
+		p.mu.Unlock()
+		defer func() {
+			p.mu.Lock()
+			if p.inFlightByHash[priorHash] == sess {
+				delete(p.inFlightByHash, priorHash)
+			}
+			p.mu.Unlock()
+		}()
+	}
+
 	sess.Worker.activeTurns.Add(1)
 	p.activeTurns.Add(1)
 	defer func() {
@@ -282,9 +311,10 @@ func (p *Pool) ExecuteTurn(
 		p.activeTurns.Add(-1)
 	}()
 
-	// Switch ACP session model if requested and different from current session state.
+	// 1. Switch ACP session model if requested and different from current session state.
 	if targetACPModel != "" && targetACPModel != sess.CurrentModel {
-		if err := sess.Worker.client.SetSessionModel(ctx, sess.ID, targetACPModel, sess.Meta); err != nil {
+		updatedOpts, err := sess.Worker.client.SetSessionModel(ctx, sess.ID, targetACPModel, sess.Meta)
+		if err != nil {
 			var rpcErr *acp.RPCError
 			if errors.As(err, &rpcErr) && rpcErr.Code == -32601 {
 				p.logger.Debug("ACP agent does not implement model switching; using agent default", "requested_model", targetACPModel)
@@ -293,10 +323,78 @@ func (p *Pool) ExecuteTurn(
 			}
 		} else {
 			sess.CurrentModel = targetACPModel
+			if len(updatedOpts) > 0 {
+				sess.Meta.ConfigOptions = updatedOpts
+				p.recordDiscoveredModels(sess.Meta)
+			}
 		}
 	}
 
-	blocks := bridge.BuildPromptBlocks(req, startIdx)
+	// 2. Switch operational mode if explicitly requested (e.g. via X-ACP-Mode header).
+	if desiredMode := strings.TrimSpace(req.Mode); desiredMode != "" && desiredMode != sess.CurrentMode {
+		updatedOpts, err := sess.Worker.client.SetSessionMode(ctx, sess.ID, desiredMode, sess.Meta)
+		if err != nil {
+			p.logger.Warn("ACP SetSessionMode returned warning", "session_id", sess.ID, "mode", desiredMode, "error", err)
+		} else {
+			sess.CurrentMode = desiredMode
+			if len(updatedOpts) > 0 {
+				sess.Meta.ConfigOptions = updatedOpts
+			}
+		}
+	}
+
+	// 3. Resolve & apply Thinking / Reasoning Effort across standard and non-standard ACP servers.
+	thinkingRes, err := acp.ResolveThinkingAction(sess.Meta, effectiveThinking, targetACPModel, p.cfg.ACP.Thinking)
+	if err != nil {
+		// StrictError mode: return session back to cache/idle if untouched or retire it, then surface error.
+		p.retireSession(sess)
+		return nil, err
+	}
+
+	thinkingStrategy := thinkingRes.Strategy
+	if thinkingRes.ConfigID != "" {
+		desiredSig := fmt.Sprintf("%s=%v", thinkingRes.ConfigID, thinkingRes.ConfigValue)
+		if desiredSig != sess.CurrentThinking {
+			updatedOpts, cfgErr := sess.Worker.client.SetConfigOption(ctx, sess.ID, thinkingRes.ConfigID, thinkingRes.ConfigValue)
+			if cfgErr != nil {
+				// Graceful degradation when optimistic override_config_id is rejected by the ACP agent.
+				p.logger.Debug("ACP SetConfigOption for thinking level not accepted; degrading gracefully",
+					"session_id", sess.ID,
+					"config_id", thinkingRes.ConfigID,
+					"value", thinkingRes.ConfigValue,
+					"error", cfgErr,
+				)
+				thinkingStrategy = thinkingStrategy + "_degraded"
+			} else {
+				sess.CurrentThinking = desiredSig
+				if len(updatedOpts) > 0 {
+					sess.Meta.ConfigOptions = updatedOpts
+				}
+			}
+		}
+	}
+	if thinkingRes.ModelOverride != "" && thinkingRes.ModelOverride != sess.CurrentModel {
+		if updatedOpts, mErr := sess.Worker.client.SetSessionModel(ctx, sess.ID, thinkingRes.ModelOverride, sess.Meta); mErr == nil {
+			sess.CurrentModel = thinkingRes.ModelOverride
+			if len(updatedOpts) > 0 {
+				sess.Meta.ConfigOptions = updatedOpts
+			}
+		}
+	}
+	if thinkingRes.ModeOverride != "" && thinkingRes.ModeOverride != sess.CurrentMode {
+		if updatedOpts, modeErr := sess.Worker.client.SetSessionMode(ctx, sess.ID, thinkingRes.ModeOverride, sess.Meta); modeErr == nil {
+			sess.CurrentMode = thinkingRes.ModeOverride
+			if len(updatedOpts) > 0 {
+				sess.Meta.ConfigOptions = updatedOpts
+			}
+		}
+	}
+
+	promptCaps := sess.Worker.client.InitResult().AgentCapabilities.PromptCapabilities
+	// Note: many ACP servers support text+image without setting promptCapabilities.image=true; only downgrade image
+	// if explicitly false AND URI fallback exists, or keep true when Data is present unless strict.
+	// Here we pass actual negotiated Audio & EmbeddedContext capabilities while allowing base64 Image when advertised.
+	blocks := bridge.BuildPromptBlocksWithCaps(req, startIdx, promptCaps, thinkingRes.PromptHint)
 
 	var (
 		thinkingBuf   strings.Builder
@@ -307,6 +405,11 @@ func (p *Pool) ExecuteTurn(
 		stopTriggered bool
 	)
 
+	exposeThoughts := p.cfg.ACP.ExposeThoughts
+	if effectiveThinking.Specified && !effectiveThinking.Enabled {
+		exposeThoughts = false
+	}
+
 	turnCtx, cancelTurn := context.WithCancel(ctx)
 	defer cancelTurn()
 
@@ -314,7 +417,7 @@ func (p *Pool) ExecuteTurn(
 		switch ev.Kind {
 		case bridge.EventThinkingDelta:
 			thinkingBuf.WriteString(ev.Text)
-			if onEvent != nil {
+			if exposeThoughts && onEvent != nil {
 				onEvent(ev)
 			}
 		case bridge.EventTextDelta:
@@ -352,28 +455,55 @@ func (p *Pool) ExecuteTurn(
 	}
 
 	toolsEnabled := len(activeTools) > 0
-	parser := bridge.NewToolStreamParser(toolsEnabled, emitEvent)
+	toolParser := bridge.NewToolStreamParser(toolsEnabled, emitEvent)
+	thinkParser := bridge.NewInlineThinkParser(
+		p.cfg.ACP.Thinking.ExtractInlineThinkTags,
+		func(thoughtChunk string) {
+			emitEvent(bridge.StreamEvent{Kind: bridge.EventThinkingDelta, Text: thoughtChunk})
+		},
+		func(textChunk string) {
+			toolParser.Feed(textChunk)
+		},
+	)
 
-	promptRes, _, promptErr := sess.Worker.client.Prompt(turnCtx, sess.ID, blocks, func(u acp.ParsedUpdate) {
+	var metaMu sync.Mutex
+	promptRes, _, promptErr := sess.Worker.client.Prompt(turnCtx, sess.ID, blocks, thinkingRes.MetaHint, func(u acp.ParsedUpdate) {
 		switch u.Kind {
 		case "agent_thought_chunk":
-			if p.cfg.ACP.ExposeThoughts && u.Text != "" {
+			thinkParser.MarkNativeThoughtSeen()
+			if u.Text != "" {
 				emitEvent(bridge.StreamEvent{Kind: bridge.EventThinkingDelta, Text: u.Text})
 			}
 		case "agent_message_chunk":
 			if u.Text != "" {
-				parser.Feed(u.Text)
+				thinkParser.Feed(u.Text)
+			}
+		case "config_option_update":
+			if len(u.ConfigOptions) > 0 {
+				metaMu.Lock()
+				sess.Meta.ConfigOptions = u.ConfigOptions
+				metaCopy := sess.Meta
+				metaMu.Unlock()
+				p.recordDiscoveredModels(metaCopy)
+			}
+		case "current_mode_update":
+			if u.CurrentModeID != "" {
+				metaMu.Lock()
+				sess.CurrentMode = u.CurrentModeID
+				metaMu.Unlock()
 			}
 		case "usage_update":
 			if u.Usage != nil {
+				metaMu.Lock()
 				agentUsage = u.Usage
+				metaMu.Unlock()
 			}
 		}
 	})
 
-	parser.Finish()
+	thinkParser.Finish()
+	toolParser.Finish()
 
-	// If we intentionally cancelled turnCtx due to matching a stop_sequence, treat as clean completion!
 	if promptErr != nil && stopTriggered && ctx.Err() == nil {
 		promptErr = nil
 	}
@@ -390,20 +520,25 @@ func (p *Pool) ExecuteTurn(
 	stopReason := normalizeStopReason(promptRes.StopReason, len(toolCalls) > 0, stoppedSeq != "")
 	inTokens, outTokens := computeTokenUsage(req, thinkingBuf.String(), textBuf.String(), toolCalls, agentUsage)
 
-	resp := &bridge.TurnResponse{
-		Model:         displayModel,
-		SessionID:     sess.ID,
-		SessionReused: reused,
-		Thinking:      thinkingBuf.String(),
-		Text:          textBuf.String(),
-		ToolCalls:     toolCalls,
-		StopReason:    stopReason,
-		StopSequence:  stoppedSeq,
-		InputTokens:   inTokens,
-		OutputTokens:  outTokens,
+	exposedThinking := ""
+	if exposeThoughts {
+		exposedThinking = thinkingBuf.String()
 	}
 
-	// Decide whether to store session in conversation cache for subsequent turns or retire it.
+	resp := &bridge.TurnResponse{
+		Model:            displayModel,
+		SessionID:        sess.ID,
+		SessionReused:    reused,
+		ThinkingStrategy: thinkingStrategy,
+		Thinking:         exposedThinking,
+		Text:             textBuf.String(),
+		ToolCalls:        toolCalls,
+		StopReason:       stopReason,
+		StopSequence:     stoppedSeq,
+		InputTokens:      inTokens,
+		OutputTokens:     outTokens,
+	}
+
 	if !stopTriggered && p.cfg.Pool.ReuseConversations && p.cfg.Pool.MaxCachedSessions > 0 && sess.Worker.client.Alive() && !sess.Worker.draining.Load() {
 		updatedMsgs := make([]bridge.UnifiedMessage, 0, len(req.Messages)+1)
 		updatedMsgs = append(updatedMsgs, req.Messages...)
@@ -427,7 +562,18 @@ func (p *Pool) acquireSession(
 	targetACPModel string,
 	activeTools []bridge.ToolDefinition,
 ) (*ManagedSession, int, bool, error) {
-	// 1. Try smart multi-turn prefix match against cached conversation sessions.
+	// 0. Explicit session resume/load request via X-ACP-Resume-Session-ID header.
+	if resumeID := strings.TrimSpace(req.ResumeSessionID); resumeID != "" {
+		if sess, err := p.resumeOrLoadSession(ctx, resumeID); err == nil {
+			startIdx := len(req.Messages) - 1
+			if startIdx < 0 {
+				startIdx = 0
+			}
+			return sess, startIdx, true, nil
+		}
+	}
+
+	// 1. Try smart multi-turn prefix match against cached conversation sessions (or native session/fork on concurrent branches!).
 	if p.cfg.Pool.ReuseConversations && len(req.Messages) > 1 {
 		for splitIdx := len(req.Messages) - 1; splitIdx >= 1; splitIdx-- {
 			if req.Messages[splitIdx-1].Role != "assistant" {
@@ -442,6 +588,17 @@ func (p *Pool) acquireSession(
 					"delta_messages", len(req.Messages)-splitIdx,
 				)
 				return sess, splitIdx, true, nil
+			}
+			// If an identical prefix session is currently in-flight on a fork-capable worker, fork it natively!
+			if p.cfg.Pool.EnableNativeSessionFork {
+				if forked := p.tryForkInFlightSession(ctx, prefixHash); forked != nil {
+					p.sessionForkHits.Add(1)
+					p.logger.Debug("forked in-flight ACP session via session/fork",
+						"new_session_id", forked.ID,
+						"split_idx", splitIdx,
+					)
+					return forked, splitIdx, true, nil
+				}
 			}
 		}
 	}
@@ -465,6 +622,65 @@ func (p *Pool) acquireSession(
 	return sess, 0, false, nil
 }
 
+func (p *Pool) resumeOrLoadSession(ctx context.Context, sessionID string) (*ManagedSession, error) {
+	w, err := p.pickHealthyWorker()
+	if err != nil {
+		return nil, err
+	}
+	caps := w.client.InitResult().AgentCapabilities
+	var meta acp.SessionNewResult
+	switch {
+	case caps.SessionCapabilities.HasResume():
+		meta, err = w.client.ResumeSession(ctx, sessionID)
+	case caps.LoadSession:
+		meta, err = w.client.LoadSession(ctx, sessionID, nil)
+	default:
+		return nil, errors.New("agent supports neither session/resume nor session/load")
+	}
+	if err != nil {
+		return nil, err
+	}
+	w.liveSessions.Add(1)
+	w.totalSessions.Add(1)
+	now := time.Now()
+	return &ManagedSession{
+		ID:         meta.SessionID,
+		Worker:     w,
+		Meta:       meta,
+		CreatedAt:  now,
+		LastUsedAt: now,
+	}, nil
+}
+
+func (p *Pool) tryForkInFlightSession(ctx context.Context, prefixHash string) *ManagedSession {
+	p.mu.Lock()
+	src := p.inFlightByHash[prefixHash]
+	p.mu.Unlock()
+
+	if src == nil || src.Worker == nil || !src.Worker.client.Alive() || src.Worker.draining.Load() || !src.Worker.client.SupportsFork() {
+		return nil
+	}
+	forkCtx, cancel := context.WithTimeout(ctx, p.cfg.SessionNewTimeout())
+	defer cancel()
+	meta, err := src.Worker.client.ForkSession(forkCtx, src.ID)
+	if err != nil {
+		return nil
+	}
+	src.Worker.liveSessions.Add(1)
+	src.Worker.totalSessions.Add(1)
+	now := time.Now()
+	return &ManagedSession{
+		ID:              meta.SessionID,
+		Worker:          src.Worker,
+		Meta:            meta,
+		CurrentModel:    src.CurrentModel,
+		CurrentMode:     src.CurrentMode,
+		CurrentThinking: src.CurrentThinking,
+		CreatedAt:       now,
+		LastUsedAt:      now,
+	}
+}
+
 func (p *Pool) checkoutCachedByHash(hash, sessionHint string) *ManagedSession {
 	now := time.Now()
 	ttl := p.cfg.CachedSessionTTL()
@@ -473,7 +689,6 @@ func (p *Pool) checkoutCachedByHash(hash, sessionHint string) *ManagedSession {
 	defer p.mu.Unlock()
 
 	bestIdx := -1
-	// Search newest -> oldest so most recent matching session wins; prefer matching SessionHint if provided.
 	for i := len(p.cachedSessions) - 1; i >= 0; i-- {
 		s := p.cachedSessions[i]
 		if !s.Worker.client.Alive() || s.Worker.draining.Load() || now.Sub(s.LastUsedAt) > ttl {
@@ -550,13 +765,25 @@ func (p *Pool) retireSession(sess *ManagedSession) {
 	if sess == nil || sess.Worker == nil {
 		return
 	}
-	remaining := sess.Worker.liveSessions.Add(-1)
-	if sess.Worker.draining.Load() && remaining <= 0 && sess.Worker.activeTurns.Load() <= 0 {
-		go func(w *acpWorker) {
-			_ = w.client.Close()
-		}(sess.Worker)
+	w := sess.Worker
+	sid := sess.ID
+
+	// Asynchronously release session state on the ACP agent via session/close (if supported by agent).
+	if sid != "" && w.client.Alive() {
+		go func() {
+			closeCtx, cancel := context.WithTimeout(p.poolCtx, 3*time.Second)
+			defer cancel()
+			_ = w.client.CloseSession(closeCtx, sid)
+		}()
 	}
-	p.maybeScheduleWorkerRotation(sess.Worker)
+
+	remaining := w.liveSessions.Add(-1)
+	if w.draining.Load() && remaining <= 0 && w.activeTurns.Load() <= 0 {
+		go func(target *acpWorker) {
+			_ = target.client.Close()
+		}(w)
+	}
+	p.maybeScheduleWorkerRotation(w)
 }
 
 func (p *Pool) maybeScheduleWorkerRotation(w *acpWorker) {
@@ -653,6 +880,10 @@ func (p *Pool) createFreshSession(ctx context.Context) (*ManagedSession, error) 
 	if meta.Models != nil {
 		currentModel = meta.Models.CurrentModelID
 	}
+	currentMode := ""
+	if meta.Modes != nil {
+		currentMode = meta.Modes.CurrentModeID
+	}
 	p.recordDiscoveredModels(meta)
 
 	now := time.Now()
@@ -661,6 +892,7 @@ func (p *Pool) createFreshSession(ctx context.Context) (*ManagedSession, error) 
 		Worker:       w,
 		Meta:         meta,
 		CurrentModel: currentModel,
+		CurrentMode:  currentMode,
 		CreatedAt:    now,
 		LastUsedAt:   now,
 	}
@@ -684,9 +916,9 @@ func (p *Pool) recordDiscoveredModels(meta acp.SessionNewResult) {
 		}
 	}
 	for _, opt := range meta.ConfigOptions {
-		if opt.Category == "model" || opt.ID == "model" {
-			if opt.CurrentValue != "" {
-				p.discoveredModels[opt.CurrentValue] = opt.CurrentValue
+		if strings.EqualFold(opt.Category, "model") || strings.EqualFold(opt.ID, "model") {
+			if cur := opt.EffectiveValue(); cur != "" {
+				p.discoveredModels[cur] = cur
 			}
 			for _, ch := range opt.ExtractChoiceValues() {
 				if ch.Value != "" {
@@ -722,7 +954,6 @@ func (p *Pool) watchWorker(w *acpWorker) {
 		return
 	}
 
-	// Purge dead sessions belonging to w.
 	p.purgeWorkerSessions(w)
 
 	p.mu.Lock()
@@ -732,7 +963,6 @@ func (p *Pool) watchWorker(w *acpWorker) {
 		return
 	}
 
-	// Respawn worker with exponential backoff.
 	backoff := 200 * time.Millisecond
 	for {
 		if p.poolCtx.Err() != nil {
@@ -791,6 +1021,12 @@ func (p *Pool) purgeWorkerSessions(dead *acpWorker) {
 		}
 	}
 	p.cachedSessions = filteredCached
+
+	for k, s := range p.inFlightByHash {
+		if s.Worker == dead {
+			delete(p.inFlightByHash, k)
+		}
+	}
 }
 
 func (p *Pool) signalReplenish() {

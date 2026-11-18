@@ -20,6 +20,17 @@ const (
 	PermissionDenyAll       PermissionPolicy = "deny_all"
 )
 
+// ThinkingFallbackStrategy defines what acp2api does when an ACP server neither advertises
+// standard thought_level configOptions nor matches heuristic config/model/mode selectors.
+type ThinkingFallbackStrategy string
+
+const (
+	ThinkingFallbackAuto        ThinkingFallbackStrategy = "auto"         // send _meta hint (if enabled) and degrade gracefully without failing
+	ThinkingFallbackPromptHint  ThinkingFallbackStrategy = "prompt_hint"  // also inject lightweight <thinking_guidance> in prompt
+	ThinkingFallbackIgnore      ThinkingFallbackStrategy = "ignore"       // silently ignore unresolvable thinking level
+	ThinkingFallbackStrictError ThinkingFallbackStrategy = "strict_error" // return HTTP 400 error if requested thinking level cannot be applied
+)
+
 // Config holds the full application configuration.
 type Config struct {
 	Server ServerConfig `json:"server"`
@@ -42,12 +53,80 @@ type EnvPair struct {
 	Value string `json:"value"`
 }
 
-// MCPServerConfig defines an MCP server passed to ACP session/new.
+// HeaderPair represents an HTTP header for HTTP/SSE MCP server definitions in ACP.
+type HeaderPair struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+// MCPServerConfig defines an MCP server passed to ACP session/new or session/load.
+// Supports ACP stdio (default), http, and sse MCP transport schemas.
 type MCPServerConfig struct {
-	Name    string    `json:"name"`
-	Command string    `json:"command"`
-	Args    []string  `json:"args"`
-	Env     []EnvPair `json:"env"`
+	Type    string       `json:"type,omitempty"`    // "" / "stdio", "http", "sse"
+	Name    string       `json:"name"`              // required for all transports
+	Command string       `json:"command,omitempty"` // for stdio
+	Args    []string     `json:"args,omitempty"`    // for stdio
+	Env     []EnvPair    `json:"env,omitempty"`     // for stdio
+	URL     string       `json:"url,omitempty"`     // for http / sse
+	Headers []HeaderPair `json:"headers,omitempty"` // for http / sse
+}
+
+// MarshalJSON ensures ACP-strict non-null slices for the selected MCP transport type.
+func (m MCPServerConfig) MarshalJSON() ([]byte, error) {
+	t := strings.ToLower(strings.TrimSpace(m.Type))
+	switch t {
+	case "http", "sse":
+		headers := m.Headers
+		if headers == nil {
+			headers = []HeaderPair{}
+		}
+		return json.Marshal(struct {
+			Type    string       `json:"type"`
+			Name    string       `json:"name"`
+			URL     string       `json:"url"`
+			Headers []HeaderPair `json:"headers"`
+		}{
+			Type:    t,
+			Name:    m.Name,
+			URL:     m.URL,
+			Headers: headers,
+		})
+	default:
+		args := m.Args
+		if args == nil {
+			args = []string{}
+		}
+		env := m.Env
+		if env == nil {
+			env = []EnvPair{}
+		}
+		if t == "stdio" {
+			return json.Marshal(struct {
+				Type    string    `json:"type"`
+				Name    string    `json:"name"`
+				Command string    `json:"command"`
+				Args    []string  `json:"args"`
+				Env     []EnvPair `json:"env"`
+			}{
+				Type:    "stdio",
+				Name:    m.Name,
+				Command: m.Command,
+				Args:    args,
+				Env:     env,
+			})
+		}
+		return json.Marshal(struct {
+			Name    string    `json:"name"`
+			Command string    `json:"command"`
+			Args    []string  `json:"args"`
+			Env     []EnvPair `json:"env"`
+		}{
+			Name:    m.Name,
+			Command: m.Command,
+			Args:    args,
+			Env:     env,
+		})
+	}
 }
 
 // ClientCapabilitiesConfig controls which local host capabilities acp2api exposes to the ACP agent.
@@ -58,12 +137,26 @@ type ClientCapabilitiesConfig struct {
 	RestrictToCwd  bool `json:"restrict_to_cwd"`
 }
 
+// ThinkingConfig controls how OpenAI reasoning_effort / Anthropic thinking parameters are mapped
+// onto standard and non-standard ACP agents.
+type ThinkingConfig struct {
+	Enabled                bool                     `json:"enabled"`
+	OverrideConfigID       string                   `json:"override_config_id,omitempty"`
+	LevelAliases           map[string]string        `json:"level_aliases,omitempty"`
+	FallbackStrategy       ThinkingFallbackStrategy `json:"fallback_strategy"`
+	SendMetaHint           bool                     `json:"send_meta_hint"`
+	ExtractInlineThinkTags bool                     `json:"extract_inline_think_tags"`
+	ParseModelSuffix       bool                     `json:"parse_model_suffix"`
+}
+
 // ACPConfig configures how the ACP stdio subprocess is launched and managed.
 type ACPConfig struct {
 	Command               string                   `json:"command"`
 	Args                  []string                 `json:"args"`
 	Env                   map[string]string        `json:"env"`
 	Cwd                   string                   `json:"cwd"`
+	AuthMethodID          string                   `json:"auth_method_id,omitempty"`
+	DefaultMode           string                   `json:"default_mode,omitempty"`
 	InitializeTimeoutSecs int                      `json:"initialize_timeout_seconds"`
 	SessionNewTimeoutSecs int                      `json:"session_new_timeout_seconds"`
 	PermissionPolicy      PermissionPolicy         `json:"permission_policy"`
@@ -73,6 +166,7 @@ type ACPConfig struct {
 	ModelAliases          map[string]string        `json:"model_aliases"`
 	PassThroughModels     bool                     `json:"pass_through_models"`
 	ExposeThoughts        bool                     `json:"expose_thoughts"`
+	Thinking              ThinkingConfig           `json:"thinking"`
 }
 
 // PoolConfig configures the ACP process pool, pre-warmed idle session pool, and conversation cache.
@@ -81,6 +175,7 @@ type PoolConfig struct {
 	IdlePoolSize            int  `json:"idle_pool_size"`
 	MaxActiveSessions       int  `json:"max_active_sessions"`
 	ReuseConversations      bool `json:"reuse_conversations"`
+	EnableNativeSessionFork bool `json:"enable_native_session_fork"`
 	MaxCachedSessions       int  `json:"max_cached_sessions"`
 	IdleSessionTTLSeconds   int  `json:"idle_session_ttl_seconds"`
 	CachedSessionTTLSeconds int  `json:"cached_session_ttl_seconds"`
@@ -102,7 +197,7 @@ func Default() Config {
 	return Config{
 		Server: ServerConfig{
 			ListenAddr:            ":8080",
-			APIKeys:                nil,
+			APIKeys:               nil,
 			ReadHeaderTimeoutSecs: 30,
 			RequestTimeoutSecs:    600,
 		},
@@ -125,12 +220,21 @@ func Default() Config {
 			ModelAliases:      map[string]string{},
 			PassThroughModels: true,
 			ExposeThoughts:    true,
+			Thinking: ThinkingConfig{
+				Enabled:                true,
+				LevelAliases:           map[string]string{},
+				FallbackStrategy:       ThinkingFallbackAuto,
+				SendMetaHint:           true,
+				ExtractInlineThinkTags: true,
+				ParseModelSuffix:       true,
+			},
 		},
 		Pool: PoolConfig{
 			ProcessCount:            1,
 			IdlePoolSize:            3,
 			MaxActiveSessions:       32,
 			ReuseConversations:      true,
+			EnableNativeSessionFork: true,
 			MaxCachedSessions:       64,
 			IdleSessionTTLSeconds:   1800,
 			CachedSessionTTLSeconds: 1800,
@@ -188,6 +292,9 @@ func (c *Config) ApplyEnv() {
 	if v := strings.TrimSpace(os.Getenv("ACP2API_PERMISSION_POLICY")); v != "" {
 		c.ACP.PermissionPolicy = PermissionPolicy(v)
 	}
+	if v := strings.TrimSpace(os.Getenv("ACP2API_THINKING_FALLBACK")); v != "" {
+		c.ACP.Thinking.FallbackStrategy = ThinkingFallbackStrategy(v)
+	}
 	if v := strings.TrimSpace(os.Getenv("ACP2API_LOG_LEVEL")); v != "" {
 		c.Log.Level = v
 	}
@@ -222,6 +329,17 @@ func (c *Config) NormalizeAndValidate() error {
 		return fmt.Errorf("invalid acp.permission_policy %q (expected allow_all, allow_read_only, or deny_all)", c.ACP.PermissionPolicy)
 	}
 
+	switch c.ACP.Thinking.FallbackStrategy {
+	case "", ThinkingFallbackAuto:
+		c.ACP.Thinking.FallbackStrategy = ThinkingFallbackAuto
+	case ThinkingFallbackPromptHint, ThinkingFallbackIgnore, ThinkingFallbackStrictError:
+	default:
+		return fmt.Errorf("invalid acp.thinking.fallback_strategy %q (expected auto, prompt_hint, ignore, or strict_error)", c.ACP.Thinking.FallbackStrategy)
+	}
+	if c.ACP.Thinking.LevelAliases == nil {
+		c.ACP.Thinking.LevelAliases = map[string]string{}
+	}
+
 	if c.ACP.InitializeTimeoutSecs <= 0 {
 		c.ACP.InitializeTimeoutSecs = 30
 	}
@@ -253,11 +371,18 @@ func (c *Config) NormalizeAndValidate() error {
 		c.ACP.MCPServers = []MCPServerConfig{}
 	}
 	for i := range c.ACP.MCPServers {
-		if c.ACP.MCPServers[i].Args == nil {
-			c.ACP.MCPServers[i].Args = []string{}
-		}
-		if c.ACP.MCPServers[i].Env == nil {
-			c.ACP.MCPServers[i].Env = []EnvPair{}
+		t := strings.ToLower(strings.TrimSpace(c.ACP.MCPServers[i].Type))
+		if t == "http" || t == "sse" {
+			if c.ACP.MCPServers[i].Headers == nil {
+				c.ACP.MCPServers[i].Headers = []HeaderPair{}
+			}
+		} else {
+			if c.ACP.MCPServers[i].Args == nil {
+				c.ACP.MCPServers[i].Args = []string{}
+			}
+			if c.ACP.MCPServers[i].Env == nil {
+				c.ACP.MCPServers[i].Env = []EnvPair{}
+			}
 		}
 	}
 	if strings.TrimSpace(c.ACP.DefaultModel) == "" {
@@ -302,6 +427,44 @@ func (c *Config) ResolveModel(requested string) (string, string) {
 	return req, req
 }
 
+// SplitModelThinkingSuffix extracts optional `:effort` or `(effort)` suffixes (e.g. `claude-sonnet-4-5:high`, `gpt-5(xhigh)`)
+// unless the full requested string matches an explicit model alias.
+func (c *Config) SplitModelThinkingSuffix(requested string) (cleanModel string, effortSuffix string) {
+	req := strings.TrimSpace(requested)
+	if req == "" || !c.ACP.Thinking.ParseModelSuffix {
+		return req, ""
+	}
+	if _, exactAlias := c.ACP.ModelAliases[req]; exactAlias {
+		return req, ""
+	}
+	// Check `model(effort)` pattern
+	if strings.HasSuffix(req, ")") {
+		if openIdx := strings.LastIndexByte(req, '('); openIdx > 0 {
+			candidate := strings.ToLower(strings.TrimSpace(req[openIdx+1 : len(req)-1]))
+			if isKnownEffortTier(candidate) {
+				return strings.TrimSpace(req[:openIdx]), candidate
+			}
+		}
+	}
+	// Check `model:effort` pattern
+	if colonIdx := strings.LastIndexByte(req, ':'); colonIdx > 0 {
+		candidate := strings.ToLower(strings.TrimSpace(req[colonIdx+1:]))
+		if isKnownEffortTier(candidate) {
+			return strings.TrimSpace(req[:colonIdx]), candidate
+		}
+	}
+	return req, ""
+}
+
+func isKnownEffortTier(s string) bool {
+	switch s {
+	case "none", "off", "disabled", "minimal", "low", "medium", "high", "xhigh", "max", "thinking":
+		return true
+	default:
+		return false
+	}
+}
+
 // stripJSONC removes // line comments, /* block comments */, and trailing commas outside string literals.
 func stripJSONC(src []byte) []byte {
 	out := make([]byte, 0, len(src))
@@ -328,7 +491,6 @@ func stripJSONC(src []byte) []byte {
 			continue
 		}
 
-		// Line comment
 		if ch == '/' && i+1 < len(src) && src[i+1] == '/' {
 			i += 2
 			for i < len(src) && src[i] != '\n' {
@@ -340,7 +502,6 @@ func stripJSONC(src []byte) []byte {
 			continue
 		}
 
-		// Block comment
 		if ch == '/' && i+1 < len(src) && src[i+1] == '*' {
 			i += 2
 			for i+1 < len(src) && !(src[i] == '*' && src[i+1] == '/') {
@@ -349,14 +510,13 @@ func stripJSONC(src []byte) []byte {
 				}
 				i++
 			}
-			i++ // skip '/'
+			i++
 			continue
 		}
 
 		out = append(out, ch)
 	}
 
-	// Second pass: remove trailing commas before '}' or ']'
 	clean := make([]byte, 0, len(out))
 	inString = false
 	escaped = false

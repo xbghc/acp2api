@@ -19,6 +19,10 @@
     "args": ["--experimental-acp"],
     "env": {},
     "cwd": ".",
+    // 可选：initialize 后自动调用 ACP authenticate 的认证方式 ID
+    "auth_method_id": "",
+    // 可选：新建 Session 后自动切换的默认运行模式（session/set_mode）
+    "default_mode": "",
     "initialize_timeout_seconds": 30,
     "session_new_timeout_seconds": 30,
 
@@ -36,38 +40,52 @@
       "restrict_to_cwd": true
     },
 
-    // 创建 ACP Session 时透传给 session/new 的 MCP 服务器列表
+    // 创建/加载 ACP Session 时透传的 MCP 服务器列表（支持 stdio / http / sse 三种传输类型）
     "mcp_servers": [],
 
     // 默认对外展示的模型名称及别名映射
     "default_model": "acp-default",
     "model_aliases": {
-      // 将客户端传入的模型名映射为特定 ACP 模型 ID；设为空字符串 "" 表示保持 Agent 默认模型不变
       "gpt-4o": "",
       "claude-sonnet-4-5": ""
     },
     "pass_through_models": true,
 
-    // 是否将 ACP 的 agent_thought_chunk 输出为 OpenAI reasoning_content / Anthropic thinking
-    "expose_thoughts": true
+    // 是否将思考流输出为 OpenAI reasoning_content / Anthropic thinking
+    "expose_thoughts": true,
+
+    // Thinking / Reasoning Level 适配与非标 ACP 降级配置
+    "thinking": {
+      "enabled": true,
+      // 可选：当 ACP 服务未在 session/new 返回标准 thought_level 时，强制指定尝试调用的 configId（如 "reasoning_effort"）
+      "override_config_id": "",
+      // 可选：自定义等级映射（如 {"high": "max"}）
+      "level_aliases": {},
+      // 当无法从 ACP 服务获取或匹配任何 thinking level 选择器时的降级策略：
+      // - "auto"        : 透传 session/prompt._meta 扩展提示并静默降级，不中断请求（推荐默认）
+      // - "prompt_hint" : 除 _meta 外，在提示词首部注入轻量 <thinking_guidance> 引导思考深度
+      // - "ignore"      : 完全静默忽略无法识别的 thinking level
+      // - "strict_error": 若底层 ACP 不支持设置 thinking level 则返回 HTTP 400 错误
+      "fallback_strategy": "auto",
+      "send_meta_hint": true,
+      // 当 ACP 服务未发送标准 agent_thought_chunk、而是在文本流首部内联输出 <think>...</think> 时自动拆分为思考流
+      "extract_inline_think_tags": true,
+      // 支持解析模型名后缀指定思考等级，如 "claude-sonnet-4-5:high" 或 "gpt-5(xhigh)"
+      "parse_model_suffix": true
+    }
   },
 
   // 进程池、预热空闲 Session 池与多轮对话复用配置
   "pool": {
-    // 常驻 ACP stdio 工作进程数量（单进程内支持多路复用多个并发 Session；异常退出自动重启）
     "process_count": 1,
-    // 后台始终保持预热就绪（已完成 session/new）的空闲 Session 数量，实现零冷启动延迟响应
     "idle_pool_size": 3,
-    // 最大并发执行中的请求数（0 表示不限制）
     "max_active_sessions": 32,
-    // 智能多轮对话复用：按消息历史前缀指纹自动匹配已有 Session 并仅发送增量消息
     "reuse_conversations": true,
-    // 多轮对话 Session 缓存上限（LRU 淘汰）
+    // 当并发请求从同一活跃会话分叉且 ACP Agent 支持 session/fork 时，使用原生 fork 克隆会话状态
+    "enable_native_session_fork": true,
     "max_cached_sessions": 64,
-    // 空闲预热 Session 与多轮缓存 Session 的存活时间（秒）
     "idle_session_ttl_seconds": 1800,
     "cached_session_ttl_seconds": 1800,
-    // 单个 ACP 进程累计创建多少个 Session 后平滑轮换进程（0 表示不轮换）
     "max_sessions_per_process": 0
   },
 

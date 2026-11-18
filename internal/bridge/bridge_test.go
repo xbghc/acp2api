@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"acp2api/internal/acp"
 )
 
 func TestToolStreamParserChunkedFragmentation(t *testing.T) {
@@ -214,5 +216,55 @@ func TestBuildPromptBlocksFullFeaturesAndTokenEstimation(t *testing.T) {
 	emptyBlocks := BuildPromptBlocks(&UnifiedRequest{}, 0)
 	if len(emptyBlocks) != 1 || emptyBlocks[0].Text != "Hello" {
 		t.Fatalf("expected fallback Hello block for empty request, got %+v", emptyBlocks)
+	}
+}
+
+func TestInlineThinkParserAndPromptCapabilityDegradation(t *testing.T) {
+	// 1. Test 1-byte streaming of <think>...</think> followed by prose mentioning <think> (which must NOT be intercepted!)
+	stream := "  \n<think>\nstep A -> step B</think>\n\nFinal answer mentioning <think> tag literally."
+	var gotThink, gotText strings.Builder
+	tp := NewInlineThinkParser(true, func(th string) { gotThink.WriteString(th) }, func(tx string) { gotText.WriteString(tx) })
+	for i := 0; i < len(stream); i++ {
+		tp.Feed(stream[i : i+1])
+	}
+	tp.Finish()
+
+	if gotThink.String() != "step A -> step B" {
+		t.Fatalf("unexpected extracted inline thought: %q", gotThink.String())
+	}
+	if gotText.String() != "Final answer mentioning <think> tag literally." {
+		t.Fatalf("unexpected extracted visible text: %q", gotText.String())
+	}
+
+	// 2. Test MarkNativeThoughtSeen() bypassing inline tag interception
+	var nativeText strings.Builder
+	tpNative := NewInlineThinkParser(true, func(string) { t.Fatalf("unexpected inline think") }, func(tx string) { nativeText.WriteString(tx) })
+	tpNative.MarkNativeThoughtSeen()
+	tpNative.Feed("<think>kept as text</think>")
+	tpNative.Finish()
+	if nativeText.String() != "<think>kept as text</think>" {
+		t.Fatalf("expected native thought mode to leave text untouched, got %q", nativeText.String())
+	}
+
+	// 3. Test Audio & Resource capability-aware encoding vs graceful fallback when capabilities are false
+	req := &UnifiedRequest{
+		Messages: []UnifiedMessage{
+			{
+				Role: "user",
+				Parts: []ContentPart{
+					{Kind: PartAudio, Audio: &AudioPayload{MimeType: "audio/wav", Data: "UklGRg=="}},
+					{Kind: PartResource, Resource: &ResourcePayload{URI: "file:///spec.md", MimeType: "text/markdown", Text: "# Spec"}},
+				},
+			},
+		},
+	}
+	richBlocks := BuildPromptBlocks(req, 0)
+	if len(richBlocks) != 2 || richBlocks[0].Type != "audio" || richBlocks[1].Type != "resource" {
+		t.Fatalf("expected native audio and resource blocks when capabilities=true, got %+v", richBlocks)
+	}
+
+	degradedBlocks := BuildPromptBlocksWithCaps(req, 0, acp.PromptCapabilities{}, "<thinking_guidance>think deeply</thinking_guidance>")
+	if len(degradedBlocks) != 1 || !strings.Contains(degradedBlocks[0].Text, "<attached_resource") || !strings.Contains(degradedBlocks[0].Text, "<thinking_guidance>") {
+		t.Fatalf("expected graceful text degradation when capabilities=false, got %+v", degradedBlocks)
 	}
 }

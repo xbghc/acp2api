@@ -8,12 +8,23 @@ import (
 	"acp2api/internal/acp"
 )
 
-// BuildPromptBlocks constructs the ACP ContentBlock slice for session/prompt.
-// When startIdx == 0, the target session is brand-new (pre-warmed idle session), so system instructions,
-// tool definitions, and any prior history are included.
-// When startIdx > 0, the target session already holds req.Messages[:startIdx], so only delta messages
-// req.Messages[startIdx:] are sent.
+// BuildPromptBlocks constructs ACP ContentBlocks assuming full multimodal prompt capabilities.
 func BuildPromptBlocks(req *UnifiedRequest, startIdx int) []acp.ContentBlock {
+	return BuildPromptBlocksWithCaps(req, startIdx, acp.PromptCapabilities{
+		Image:           true,
+		Audio:           true,
+		EmbeddedContext: true,
+	}, "")
+}
+
+// BuildPromptBlocksWithCaps constructs the ACP ContentBlock slice for session/prompt while respecting
+// the agent's negotiated PromptCapabilities (gracefully degrading unsupported rich media types).
+func BuildPromptBlocksWithCaps(
+	req *UnifiedRequest,
+	startIdx int,
+	caps acp.PromptCapabilities,
+	thinkingPromptHint string,
+) []acp.ContentBlock {
 	var blocks []acp.ContentBlock
 	var preamble strings.Builder
 
@@ -29,11 +40,15 @@ func BuildPromptBlocks(req *UnifiedRequest, startIdx int) []acp.ContentBlock {
 			preamble.WriteString("\n\n")
 		}
 	} else if len(req.Tools) > 0 {
-		// On incremental turns, only add a lightweight directive if tool_choice forces specific behavior.
 		if directive := buildTurnToolChoiceDirective(req.ToolChoice); directive != "" {
 			preamble.WriteString(directive)
 			preamble.WriteString("\n\n")
 		}
+	}
+
+	if strings.TrimSpace(thinkingPromptHint) != "" {
+		preamble.WriteString(strings.TrimSpace(thinkingPromptHint))
+		preamble.WriteString("\n\n")
 	}
 
 	msgs := req.Messages[startIdx:]
@@ -45,8 +60,6 @@ func BuildPromptBlocks(req *UnifiedRequest, startIdx int) []acp.ContentBlock {
 		return []acp.ContentBlock{{Type: "text", Text: text}}
 	}
 
-	// If there are multiple messages to send (e.g. replaying prior history on a fresh session, or multiple delta messages),
-	// format messages[:len-1] as structured conversation context and messages[len-1] as the active turn.
 	if len(msgs) > 1 {
 		preamble.WriteString("<conversation_history>\n")
 		for i := 0; i < len(msgs)-1; i++ {
@@ -64,7 +77,7 @@ func BuildPromptBlocks(req *UnifiedRequest, startIdx int) []acp.ContentBlock {
 	}
 
 	lastMsg := msgs[len(msgs)-1]
-	lastBlocks := formatActiveMessageBlocks(lastMsg)
+	lastBlocks := formatActiveMessageBlocks(lastMsg, caps)
 	blocks = append(blocks, lastBlocks...)
 
 	if len(req.StopSequences) > 0 {
@@ -74,7 +87,6 @@ func BuildPromptBlocks(req *UnifiedRequest, startIdx int) []acp.ContentBlock {
 		})
 	}
 
-	// Merge adjacent text blocks so ACP servers receive clean, compact prompt arrays.
 	return coalesceTextBlocks(blocks)
 }
 
@@ -146,6 +158,14 @@ func formatMessageAsHistory(m UnifiedMessage) string {
 			sb.WriteString("\n")
 		case PartImage:
 			sb.WriteString("[Image attached]\n")
+		case PartAudio:
+			sb.WriteString("[Audio attached]\n")
+		case PartResource:
+			if p.Resource != nil && p.Resource.Text != "" {
+				sb.WriteString(fmt.Sprintf("<resource uri=%q>\n%s\n</resource>\n", p.Resource.URI, p.Resource.Text))
+			} else {
+				sb.WriteString("[Resource attached]\n")
+			}
 		case PartToolCall:
 			if p.ToolCall != nil {
 				sb.WriteString(fmt.Sprintf("<tool_call>\n{\"id\": %q, \"name\": %q, \"arguments\": %s}\n</tool_call>\n",
@@ -161,7 +181,7 @@ func formatMessageAsHistory(m UnifiedMessage) string {
 	return strings.TrimRight(sb.String(), "\n")
 }
 
-func formatActiveMessageBlocks(m UnifiedMessage) []acp.ContentBlock {
+func formatActiveMessageBlocks(m UnifiedMessage, caps acp.PromptCapabilities) []acp.ContentBlock {
 	var blocks []acp.ContentBlock
 	for _, p := range m.Parts {
 		switch p.Kind {
@@ -174,7 +194,15 @@ func formatActiveMessageBlocks(m UnifiedMessage) []acp.ContentBlock {
 			}
 		case PartImage:
 			if p.Image != nil {
-				blocks = append(blocks, imagePayloadToBlock(*p.Image))
+				blocks = append(blocks, imagePayloadToBlock(*p.Image, caps.Image))
+			}
+		case PartAudio:
+			if p.Audio != nil {
+				blocks = append(blocks, audioPayloadToBlock(*p.Audio, caps.Audio))
+			}
+		case PartResource:
+			if p.Resource != nil {
+				blocks = append(blocks, resourcePayloadToBlock(*p.Resource, caps.EmbeddedContext))
 			}
 		case PartToolCall:
 			if p.ToolCall != nil {
@@ -191,7 +219,7 @@ func formatActiveMessageBlocks(m UnifiedMessage) []acp.ContentBlock {
 					Text: formatToolResultXML(p.ToolResult) + "\n",
 				})
 				for _, img := range p.ToolResult.Images {
-					blocks = append(blocks, imagePayloadToBlock(img))
+					blocks = append(blocks, imagePayloadToBlock(img, caps.Image))
 				}
 			}
 		}
@@ -215,12 +243,12 @@ func formatToolResultXML(tr *ToolResultVal) string {
 		tr.ToolCallID, status, tr.Content)
 }
 
-func imagePayloadToBlock(img ImagePayload) acp.ContentBlock {
+func imagePayloadToBlock(img ImagePayload, imageSupported bool) acp.ContentBlock {
 	mime := strings.TrimSpace(img.MimeType)
 	if mime == "" {
 		mime = "image/png"
 	}
-	if img.Data != "" {
+	if img.Data != "" && imageSupported {
 		return acp.ContentBlock{
 			Type:     "image",
 			MimeType: mime,
@@ -228,9 +256,73 @@ func imagePayloadToBlock(img ImagePayload) acp.ContentBlock {
 			URI:      img.URI,
 		}
 	}
+	if img.URI != "" {
+		return acp.ContentBlock{
+			Type:     "resource_link",
+			URI:      img.URI,
+			Name:     "image",
+			MimeType: mime,
+		}
+	}
 	return acp.ContentBlock{
 		Type: "text",
-		Text: fmt.Sprintf("[Image URL: %s]", img.URI),
+		Text: fmt.Sprintf("[Image attachment (%s) omitted: agent does not advertise image prompt capability]", mime),
+	}
+}
+
+func audioPayloadToBlock(aud AudioPayload, audioSupported bool) acp.ContentBlock {
+	mime := strings.TrimSpace(aud.MimeType)
+	if mime == "" {
+		mime = "audio/wav"
+	}
+	if aud.Data != "" && audioSupported {
+		return acp.ContentBlock{
+			Type:     "audio",
+			MimeType: mime,
+			Data:     aud.Data,
+		}
+	}
+	return acp.ContentBlock{
+		Type: "text",
+		Text: fmt.Sprintf("[Audio attachment (%s) omitted: agent does not advertise audio prompt capability]", mime),
+	}
+}
+
+func resourcePayloadToBlock(res ResourcePayload, embeddedSupported bool) acp.ContentBlock {
+	uri := strings.TrimSpace(res.URI)
+	if uri == "" {
+		if res.Name != "" {
+			uri = "file:///" + res.Name
+		} else {
+			uri = "file:///document"
+		}
+	}
+	if embeddedSupported && (res.Text != "" || res.Blob != "") {
+		return acp.ContentBlock{
+			Type: "resource",
+			Resource: &acp.EmbeddedResource{
+				URI:      uri,
+				MimeType: res.MimeType,
+				Text:     res.Text,
+				Blob:     res.Blob,
+			},
+		}
+	}
+	if res.Text != "" {
+		return acp.ContentBlock{
+			Type: "text",
+			Text: fmt.Sprintf("<attached_resource uri=%q>\n%s\n</attached_resource>", uri, res.Text),
+		}
+	}
+	name := res.Name
+	if name == "" {
+		name = uri
+	}
+	return acp.ContentBlock{
+		Type:     "resource_link",
+		URI:      uri,
+		Name:     name,
+		MimeType: res.MimeType,
 	}
 }
 

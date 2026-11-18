@@ -86,8 +86,8 @@ func (s *Server) withMiddlewares(next http.Handler) http.Handler {
 		start := time.Now()
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Key, Anthropic-Version, Anthropic-Beta, X-Session-ID, OpenAI-Beta, OpenAI-Organization")
-		w.Header().Set("Access-Control-Expose-Headers", "X-ACP-Session-ID, X-ACP-Session-Reused")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Key, Anthropic-Version, Anthropic-Beta, X-Session-ID, X-ACP-Mode, X-ACP-Resume-Session-ID, OpenAI-Beta, OpenAI-Organization")
+		w.Header().Set("Access-Control-Expose-Headers", "X-ACP-Session-ID, X-ACP-Session-Reused, X-ACP-Thinking-Strategy")
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -142,4 +142,12 @@ func resolveSessionHint(r *http.Request, fallback string) string {
 		return h
 	}
 	return strings.TrimSpace(fallback)
+}
+
+func resolveACPMode(r *http.Request) string {
+	return strings.TrimSpace(r.Header.Get("X-ACP-Mode"))
+}
+
+func resolveResumeSessionID(r *http.Request) string {
+	return strings.TrimSpace(r.Header.Get("X-ACP-Resume-Session-ID"))
 }

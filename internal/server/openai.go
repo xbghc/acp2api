@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"acp2api/internal/acp"
 	"acp2api/internal/bridge"
 )
 
@@ -53,14 +54,15 @@ func (s *Server) handleOpenAIRetrieveModel(w http.ResponseWriter, r *http.Reques
 // --- OpenAI Chat Completions (/v1/chat/completions) ---
 
 type openAIChatRequest struct {
-	Model         string              `json:"model"`
-	Messages      []openAIMessage     `json:"messages"`
-	Stream        bool                `json:"stream"`
-	StreamOptions *openAIStreamOpts   `json:"stream_options,omitempty"`
-	Tools         []openAITool        `json:"tools,omitempty"`
-	ToolChoice    json.RawMessage     `json:"tool_choice,omitempty"`
-	Stop          json.RawMessage     `json:"stop,omitempty"`
-	User          string              `json:"user,omitempty"`
+	Model           string            `json:"model"`
+	Messages        []openAIMessage   `json:"messages"`
+	Stream          bool              `json:"stream"`
+	StreamOptions   *openAIStreamOpts `json:"stream_options,omitempty"`
+	Tools           []openAITool      `json:"tools,omitempty"`
+	ToolChoice      json.RawMessage   `json:"tool_choice,omitempty"`
+	Stop            json.RawMessage   `json:"stop,omitempty"`
+	ReasoningEffort string            `json:"reasoning_effort,omitempty"`
+	User            string            `json:"user,omitempty"`
 }
 
 type openAIStreamOpts struct {
@@ -126,19 +128,17 @@ func (s *Server) handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Requ
 
 	resp, err := s.pool.ExecuteTurn(ctx, uReq, nil)
 	if err != nil {
-		status := http.StatusBadGateway
-		if errors.Is(err, context.Canceled) {
-			status = 499
-		} else if errors.Is(err, context.DeadlineExceeded) {
-			status = http.StatusGatewayTimeout
-		}
-		writeOpenAIError(w, status, "server_error", err.Error())
+		status, errType := classifyTurnErrorOpenAI(err)
+		writeOpenAIError(w, status, errType, err.Error())
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-ACP-Session-ID", resp.SessionID)
 	w.Header().Set("X-ACP-Session-Reused", strconv.FormatBool(resp.SessionReused))
+	if resp.ThinkingStrategy != "" && resp.ThinkingStrategy != "none" {
+		w.Header().Set("X-ACP-Thinking-Strategy", resp.ThinkingStrategy)
+	}
 
 	msgObj := map[string]any{
 		"role": "assistant",
@@ -187,6 +187,19 @@ func (s *Server) handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Requ
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
+func classifyTurnErrorOpenAI(err error) (int, string) {
+	switch {
+	case errors.Is(err, acp.ErrUnsupportedThinkingLevel):
+		return http.StatusBadRequest, "invalid_request_error"
+	case errors.Is(err, context.Canceled):
+		return 499, "invalid_request_error"
+	case errors.Is(err, context.DeadlineExceeded):
+		return http.StatusGatewayTimeout, "server_error"
+	default:
+		return http.StatusBadGateway, "server_error"
+	}
+}
+
 func (s *Server) serveOpenAIChatStream(
 	ctx context.Context,
 	w http.ResponseWriter,
@@ -202,6 +215,9 @@ func (s *Server) serveOpenAIChatStream(
 	completionID := newShortID("chatcmpl-")
 	created := time.Now().Unix()
 	_, displayModel := s.cfg.ResolveModel(uReq.Model)
+	if strings.TrimSpace(uReq.Model) != "" {
+		displayModel = strings.TrimSpace(uReq.Model)
+	}
 
 	headersSent := false
 	toolIdx := 0
@@ -240,7 +256,6 @@ func (s *Server) serveOpenAIChatStream(
 			}
 			idx := toolIdx
 			toolIdx++
-			// Emit function header delta followed by arguments delta per OpenAI SSE convention.
 			writeOpenAISSEChunk(w, flusher, completionID, created, displayModel, map[string]any{
 				"tool_calls": []map[string]any{
 					{
@@ -269,11 +284,8 @@ func (s *Server) serveOpenAIChatStream(
 
 	if err != nil {
 		if !headersSent {
-			status := http.StatusBadGateway
-			if errors.Is(err, context.DeadlineExceeded) {
-				status = http.StatusGatewayTimeout
-			}
-			writeOpenAIError(w, status, "server_error", err.Error())
+			status, errType := classifyTurnErrorOpenAI(err)
+			writeOpenAIError(w, status, errType, err.Error())
 			return
 		}
 		errPayload, _ := json.Marshal(map[string]any{
@@ -435,14 +447,17 @@ func convertOpenAIChatRequest(raw *openAIChatRequest, r *http.Request) (*bridge.
 	}
 
 	return &bridge.UnifiedRequest{
-		Model:         raw.Model,
-		SessionHint:   resolveSessionHint(r, raw.User),
-		System:        strings.Join(sysParts, "\n\n"),
-		Messages:      messages,
-		Tools:         tools,
-		ToolChoice:    parseOpenAIToolChoice(raw.ToolChoice),
-		Stream:        raw.Stream,
-		StopSequences: parseStopSequences(raw.Stop),
+		Model:           raw.Model,
+		SessionHint:     resolveSessionHint(r, raw.User),
+		ResumeSessionID: resolveResumeSessionID(r),
+		Mode:            resolveACPMode(r),
+		Thinking:        acp.NormalizeThinkingIntent(nil, raw.ReasoningEffort, 0),
+		System:          strings.Join(sysParts, "\n\n"),
+		Messages:        messages,
+		Tools:           tools,
+		ToolChoice:      parseOpenAIToolChoice(raw.ToolChoice),
+		Stream:          raw.Stream,
+		StopSequences:   parseStopSequences(raw.Stop),
 	}, nil
 }
 
@@ -468,6 +483,14 @@ func parseOpenAIContent(raw json.RawMessage) (string, []bridge.ContentPart, erro
 			ImageURL *struct {
 				URL string `json:"url"`
 			} `json:"image_url"`
+			InputAudio *struct {
+				Data   string `json:"data"`
+				Format string `json:"format"`
+			} `json:"input_audio"`
+			File *struct {
+				Filename string `json:"filename"`
+				FileData string `json:"file_data"`
+			} `json:"file"`
 		}
 		if err := json.Unmarshal(trimmed, &items); err != nil {
 			return "", nil, fmt.Errorf("invalid content array: %w", err)
@@ -484,6 +507,26 @@ func parseOpenAIContent(raw json.RawMessage) (string, []bridge.ContentPart, erro
 					img := parseImageURL(it.ImageURL.URL)
 					parts = append(parts, bridge.ContentPart{Kind: bridge.PartImage, Image: &img})
 				}
+			case "input_audio":
+				if it.InputAudio != nil && it.InputAudio.Data != "" {
+					mime := "audio/wav"
+					if f := strings.ToLower(strings.TrimSpace(it.InputAudio.Format)); f != "" {
+						if f == "mp3" {
+							mime = "audio/mpeg"
+						} else if !strings.Contains(f, "/") {
+							mime = "audio/" + f
+						} else {
+							mime = f
+						}
+					}
+					aud := bridge.AudioPayload{MimeType: mime, Data: it.InputAudio.Data}
+					parts = append(parts, bridge.ContentPart{Kind: bridge.PartAudio, Audio: &aud})
+				}
+			case "file", "input_file":
+				if it.File != nil {
+					res := parseOpenAIFileResource(it.File.Filename, it.File.FileData)
+					parts = append(parts, bridge.ContentPart{Kind: bridge.PartResource, Resource: &res})
+				}
 			}
 		}
 		return sb.String(), parts, nil
@@ -491,9 +534,32 @@ func parseOpenAIContent(raw json.RawMessage) (string, []bridge.ContentPart, erro
 	return "", nil, errors.New("message content must be a string, array, or null")
 }
 
+func parseOpenAIFileResource(filename, fileData string) bridge.ResourcePayload {
+	uri := "file:///attachment"
+	if filename != "" {
+		uri = "file:///" + filename
+	}
+	mime := "application/octet-stream"
+	blob := fileData
+	if strings.HasPrefix(fileData, "data:") {
+		rest := fileData[len("data:"):]
+		if semi := strings.Index(rest, ";base64,"); semi >= 0 {
+			if rest[:semi] != "" {
+				mime = rest[:semi]
+			}
+			blob = rest[semi+len(";base64,"):]
+		}
+	}
+	return bridge.ResourcePayload{
+		URI:      uri,
+		Name:     filename,
+		MimeType: mime,
+		Blob:     blob,
+	}
+}
+
 func parseImageURL(u string) bridge.ImagePayload {
 	if strings.HasPrefix(u, "data:") {
-		// Format: data:<mime>;base64,<data>
 		rest := u[len("data:"):]
 		if semi := strings.Index(rest, ";base64,"); semi >= 0 {
 			mime := rest[:semi]
@@ -578,11 +644,15 @@ func mapOpenAIFinishReason(stopReason string) string {
 // --- OpenAI Responses API (/v1/responses) ---
 
 type openAIResponsesRequest struct {
-	Model        string          `json:"model"`
-	Instructions string          `json:"instructions,omitempty"`
-	Input        json.RawMessage `json:"input"`
-	Stream       bool            `json:"stream"`
-	Tools        []struct {
+	Model           string          `json:"model"`
+	Instructions    string          `json:"instructions,omitempty"`
+	Input           json.RawMessage `json:"input"`
+	Stream          bool            `json:"stream"`
+	ReasoningEffort string          `json:"reasoning_effort,omitempty"`
+	Reasoning       *struct {
+		Effort string `json:"effort,omitempty"`
+	} `json:"reasoning,omitempty"`
+	Tools []struct {
 		Type        string          `json:"type"`
 		Name        string          `json:"name"`
 		Description string          `json:"description,omitempty"`
@@ -620,13 +690,17 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.pool.ExecuteTurn(ctx, uReq, nil)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, "server_error", err.Error())
+		status, errType := classifyTurnErrorOpenAI(err)
+		writeOpenAIError(w, status, errType, err.Error())
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-ACP-Session-ID", resp.SessionID)
 	w.Header().Set("X-ACP-Session-Reused", strconv.FormatBool(resp.SessionReused))
+	if resp.ThinkingStrategy != "" && resp.ThinkingStrategy != "none" {
+		w.Header().Set("X-ACP-Thinking-Strategy", resp.ThinkingStrategy)
+	}
 
 	payload := buildResponsesObject(newShortID("resp_"), resp)
 	_ = json.NewEncoder(w).Encode(payload)
@@ -718,19 +792,39 @@ func convertOpenAIResponsesRequest(raw *openAIResponsesRequest, r *http.Request)
 		}
 	}
 
+	effort := raw.ReasoningEffort
+	if effort == "" && raw.Reasoning != nil {
+		effort = raw.Reasoning.Effort
+	}
+
 	return &bridge.UnifiedRequest{
-		Model:       raw.Model,
-		SessionHint: resolveSessionHint(r, raw.User),
-		System:      strings.Join(sysParts, "\n\n"),
-		Messages:    msgs,
-		Tools:       tools,
-		ToolChoice:  parseOpenAIToolChoice(raw.ToolChoice),
-		Stream:      raw.Stream,
+		Model:           raw.Model,
+		SessionHint:     resolveSessionHint(r, raw.User),
+		ResumeSessionID: resolveResumeSessionID(r),
+		Mode:            resolveACPMode(r),
+		Thinking:        acp.NormalizeThinkingIntent(nil, effort, 0),
+		System:          strings.Join(sysParts, "\n\n"),
+		Messages:        msgs,
+		Tools:           tools,
+		ToolChoice:      parseOpenAIToolChoice(raw.ToolChoice),
+		Stream:          raw.Stream,
 	}, nil
 }
 
 func buildResponsesObject(respID string, resp *bridge.TurnResponse) map[string]any {
 	var output []map[string]any
+	if resp.Thinking != "" {
+		output = append(output, map[string]any{
+			"type": "reasoning",
+			"id":   newShortID("rs_"),
+			"summary": []map[string]any{
+				{
+					"type": "summary_text",
+					"text": resp.Thinking,
+				},
+			},
+		})
+	}
 	if resp.Text != "" || len(resp.ToolCalls) == 0 {
 		output = append(output, map[string]any{
 			"type":   "message",
@@ -780,6 +874,9 @@ func (s *Server) serveOpenAIResponsesStream(ctx context.Context, w http.Response
 	}
 	respID := newShortID("resp_")
 	_, displayModel := s.cfg.ResolveModel(uReq.Model)
+	if strings.TrimSpace(uReq.Model) != "" {
+		displayModel = strings.TrimSpace(uReq.Model)
+	}
 	headersSent := false
 
 	writeEvent := func(eventName string, payload map[string]any) {
@@ -835,7 +932,8 @@ func (s *Server) serveOpenAIResponsesStream(ctx context.Context, w http.Response
 
 	if err != nil {
 		if !headersSent {
-			writeOpenAIError(w, http.StatusBadGateway, "server_error", err.Error())
+			status, errType := classifyTurnErrorOpenAI(err)
+			writeOpenAIError(w, status, errType, err.Error())
 			return
 		}
 		writeEvent("error", map[string]any{"type": "error", "message": err.Error()})

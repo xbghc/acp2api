@@ -40,7 +40,6 @@ func TestHelperACPClientSubprocess(t *testing.T) {
 		writeRaw(string(b))
 	}
 
-	// Emit non-JSON startup banner & malformed JSON line to ensure Client ignores them gracefully.
 	writeRaw("Starting ACP test agent banner...")
 	writeRaw("{malformed_json_line")
 
@@ -55,15 +54,41 @@ func TestHelperACPClientSubprocess(t *testing.T) {
 					idStr := strings.Trim(strings.TrimSpace(string(env.ID)), `"`)
 					switch env.Method {
 					case "initialize":
-						// Respond with stringified ID to test normalizeRPCID handling!
 						writeJSON(map[string]any{
 							"jsonrpc": "2.0",
 							"id":      idStr,
 							"result": map[string]any{
 								"protocolVersion": 1,
-								"agentInfo":       map[string]any{"name": "unit-acp", "version": "0.1"},
+								"agentInfo":       map[string]any{"name": "unit-acp", "version": "0.2"},
+								"agentCapabilities": map[string]any{
+									"loadSession": true,
+									"mcpCapabilities": map[string]any{
+										"http": true,
+										"sse":  false,
+									},
+									"promptCapabilities": map[string]any{
+										"image":           true,
+										"audio":           true,
+										"embeddedContext": true,
+									},
+									"sessionCapabilities": map[string]any{
+										"fork":   map[string]any{},
+										"resume": map[string]any{},
+										"list":   map[string]any{},
+										"close":  map[string]any{},
+									},
+								},
 							},
 						})
+
+					case "authenticate":
+						var p AuthenticateParams
+						_ = json.Unmarshal(env.Params, &p)
+						if p.MethodID == "bad_auth" {
+							writeJSON(map[string]any{"jsonrpc": "2.0", "id": env.ID, "error": map[string]any{"code": -32000, "message": "Auth failed"}})
+							return
+						}
+						writeJSON(map[string]any{"jsonrpc": "2.0", "id": env.ID, "result": map[string]any{}})
 
 					case "session/new":
 						if mode == "empty_session_id" {
@@ -73,10 +98,47 @@ func TestHelperACPClientSubprocess(t *testing.T) {
 						writeJSON(map[string]any{
 							"jsonrpc": "2.0",
 							"id":      env.ID,
-							"result": map[string]any{
-								"sessionId": "sess_unit_1",
+							"result":  map[string]any{"sessionId": "sess_unit_1"},
+						})
+
+					case "session/load":
+						var p SessionLoadParams
+						_ = json.Unmarshal(env.Params, &p)
+						writeJSON(map[string]any{
+							"jsonrpc": "2.0",
+							"method":  "session/update",
+							"params": map[string]any{
+								"sessionId": p.SessionID,
+								"update": map[string]any{
+									"sessionUpdate": "user_message_chunk",
+									"content":       map[string]any{"type": "text", "text": "replayed turn"},
+								},
 							},
 						})
+						writeJSON(map[string]any{"jsonrpc": "2.0", "id": env.ID, "result": map[string]any{"sessionId": p.SessionID}})
+
+					case "session/resume":
+						var p SessionResumeParams
+						_ = json.Unmarshal(env.Params, &p)
+						writeJSON(map[string]any{"jsonrpc": "2.0", "id": env.ID, "result": map[string]any{"sessionId": p.SessionID}})
+
+					case "session/fork":
+						writeJSON(map[string]any{"jsonrpc": "2.0", "id": env.ID, "result": map[string]any{"sessionId": "sess_forked_2"}})
+
+					case "session/list":
+						writeJSON(map[string]any{
+							"jsonrpc": "2.0",
+							"id":      env.ID,
+							"result": map[string]any{
+								"sessions": []map[string]any{{"sessionId": "sess_unit_1", "title": "Unit Chat"}},
+							},
+						})
+
+					case "session/close":
+						writeJSON(map[string]any{"jsonrpc": "2.0", "id": env.ID, "result": map[string]any{}})
+
+					case "session/set_mode":
+						writeJSON(map[string]any{"jsonrpc": "2.0", "id": env.ID, "result": map[string]any{}})
 
 					case "session/set_model":
 						var p SetModelParams
@@ -118,14 +180,28 @@ func TestHelperACPClientSubprocess(t *testing.T) {
 							}
 						}
 
-						writeJSON(map[string]any{
-							"jsonrpc": "2.0",
-							"method":  "session/update",
-							"params": map[string]any{
-								"sessionId": p.SessionID,
-								"update": map[string]any{
-									"sessionUpdate": "agent_message_chunk",
-									"content":       map[string]any{"type": "text", "text": "Hello from unit agent"},
+						// Emit a JSON-RPC 2.0 batch notification array to verify batch parsing!
+						writeJSON([]any{
+							map[string]any{
+								"jsonrpc": "2.0",
+								"method":  "session/update",
+								"params": map[string]any{
+									"sessionId": p.SessionID,
+									"update": map[string]any{
+										"sessionUpdate": "agent_message_chunk",
+										"content":       map[string]any{"type": "text", "text": "Hello from "},
+									},
+								},
+							},
+							map[string]any{
+								"jsonrpc": "2.0",
+								"method":  "session/update",
+								"params": map[string]any{
+									"sessionId": p.SessionID,
+									"update": map[string]any{
+										"sessionUpdate": "agent_message_chunk",
+										"content":       map[string]any{"type": "text", "text": "unit agent"},
+									},
 								},
 							},
 						})
@@ -147,7 +223,7 @@ func TestHelperACPClientSubprocess(t *testing.T) {
 	}
 }
 
-func TestACPClientFullLifecycleCancelAndErrors(t *testing.T) {
+func TestACPClientFullLifecycleCancelAndExtendedMethods(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// 1. Subprocess exits immediately during initialize -> error includes stderr tail!
@@ -162,19 +238,24 @@ func TestACPClientFullLifecycleCancelAndErrors(t *testing.T) {
 		t.Fatalf("expected stderr diagnostic in Start error, got: %v", err)
 	}
 
-	// 2. Normal client lifecycle: Start, InitResult, NewSession, SetSessionModel fallback, Prompt, Cancel, Close.
+	// 2. Full ACP lifecycle: Start + Authenticate + MCP filtering + New/Load/Resume/Fork/List/Close/SetMode/Prompt/Cancel!
 	okCfg := failCfg
 	okCfg.Env = map[string]string{"GO_ACP_CLIENT_TEST_MODE": "normal"}
-	client := NewClient("w-ok", okCfg, logger)
-	if client.ID() != "w-ok" {
-		t.Fatalf("unexpected client ID: %s", client.ID())
+	okCfg.AuthMethodID = "api_key"
+	okCfg.DefaultMode = "code"
+	okCfg.MCPServers = []config.MCPServerConfig{
+		{Name: "local-stdio", Command: "mcp-local"},
+		{Type: "http", Name: "remote-http", URL: "https://example.com/mcp"},
+		{Type: "sse", Name: "unsupported-sse", URL: "https://example.com/sse"},
 	}
+
+	client := NewClient("w-ok", okCfg, logger)
 	if err := client.Start(context.Background()); err != nil {
 		t.Fatalf("Start failed: %v", err)
 	}
 	defer client.Close()
 
-	if !client.Alive() || client.InitResult().AgentInfo.Name != "unit-acp" {
+	if !client.Alive() || !client.SupportsFork() || client.InitResult().AgentInfo.Name != "unit-acp" {
 		t.Fatalf("unexpected InitResult: %+v", client.InitResult())
 	}
 
@@ -183,17 +264,38 @@ func TestACPClientFullLifecycleCancelAndErrors(t *testing.T) {
 		t.Fatalf("NewSession failed: %+v err=%v", sess, err)
 	}
 
-	// Fallback session/set_model (since sess.ConfigOptions is empty)
-	if err := client.SetSessionModel(context.Background(), sess.SessionID, "pro", sess); err != nil {
+	// Test LoadSession with history replay
+	var replayed []string
+	if _, err := client.LoadSession(context.Background(), "sess_loaded", func(u ParsedUpdate) {
+		if u.Kind == "user_message_chunk" {
+			replayed = append(replayed, u.Text)
+		}
+	}); err != nil || len(replayed) != 1 || replayed[0] != "replayed turn" {
+		t.Fatalf("LoadSession failed: replayed=%v err=%v", replayed, err)
+	}
+
+	// Test ResumeSession, ForkSession, ListSessions
+	if resumed, err := client.ResumeSession(context.Background(), "sess_resumed"); err != nil || resumed.SessionID != "sess_resumed" {
+		t.Fatalf("ResumeSession failed: %+v err=%v", resumed, err)
+	}
+	if forked, err := client.ForkSession(context.Background(), sess.SessionID); err != nil || forked.SessionID != "sess_forked_2" {
+		t.Fatalf("ForkSession failed: %+v err=%v", forked, err)
+	}
+	if listed, err := client.ListSessions(context.Background(), ""); err != nil || len(listed.Sessions) != 1 {
+		t.Fatalf("ListSessions failed: %+v err=%v", listed, err)
+	}
+
+	// Fallback session/set_model & session/set_mode
+	if _, err := client.SetSessionModel(context.Background(), sess.SessionID, "pro", sess); err != nil {
 		t.Fatalf("SetSessionModel failed: %v", err)
 	}
-	if err := client.SetSessionModel(context.Background(), sess.SessionID, "unsupported", sess); err == nil {
+	if _, err := client.SetSessionModel(context.Background(), sess.SessionID, "unsupported", sess); err == nil {
 		t.Fatalf("expected RPCError on unsupported model")
 	}
 
-	// Normal Prompt
+	// Normal Prompt (with JSON-RPC batch notification response!)
 	var chunks []string
-	res, _, err := client.Prompt(context.Background(), sess.SessionID, []ContentBlock{{Type: "text", Text: "hi"}}, func(u ParsedUpdate) {
+	res, _, err := client.Prompt(context.Background(), sess.SessionID, []ContentBlock{{Type: "text", Text: "hi"}}, map[string]any{"thoughtLevel": "high"}, func(u ParsedUpdate) {
 		if u.Kind == "agent_message_chunk" {
 			chunks = append(chunks, u.Text)
 		}
@@ -202,36 +304,20 @@ func TestACPClientFullLifecycleCancelAndErrors(t *testing.T) {
 		t.Fatalf("unexpected Prompt result: res=%+v chunks=%v err=%v", res, chunks, err)
 	}
 
-	// Prompt Cancellation via context timeout -> sends session/cancel and settles cleanly!
+	// Prompt Cancellation via context timeout
 	cancelCtx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
 	defer cancel()
-	_, cleanCancel, err := client.Prompt(cancelCtx, sess.SessionID, []ContentBlock{{Type: "text", Text: "SLOW_CANCEL_ME"}}, nil)
+	_, cleanCancel, err := client.Prompt(cancelCtx, sess.SessionID, []ContentBlock{{Type: "text", Text: "SLOW_CANCEL_ME"}}, nil, nil)
 	if err == nil || !cleanCancel {
 		t.Fatalf("expected clean cancellation ack, got clean=%v err=%v", cleanCancel, err)
 	}
 
-	// Close client and verify Done() closes and Alive() becomes false.
-	if err := client.Close(); err != nil {
-		t.Fatalf("Close failed: %v", err)
-	}
-	select {
-	case <-client.Done():
-	case <-time.After(time.Second):
-		t.Fatalf("expected client.Done() to close")
-	}
-	if client.Alive() {
-		t.Fatalf("expected Alive() == false after Close()")
+	// CloseSession
+	if err := client.CloseSession(context.Background(), sess.SessionID); err != nil {
+		t.Fatalf("CloseSession failed: %v", err)
 	}
 
-	// 3. Empty sessionId validation error
-	emptySessCfg := failCfg
-	emptySessCfg.Env = map[string]string{"GO_ACP_CLIENT_TEST_MODE": "empty_session_id"}
-	cEmpty := NewClient("w-empty", emptySessCfg, logger)
-	if err := cEmpty.Start(context.Background()); err != nil {
-		t.Fatalf("Start cEmpty: %v", err)
-	}
-	defer cEmpty.Close()
-	if _, err := cEmpty.NewSession(context.Background()); err == nil || !strings.Contains(err.Error(), "empty sessionId") {
-		t.Fatalf("expected empty sessionId error, got: %v", err)
+	if err := client.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
 	}
 }

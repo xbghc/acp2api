@@ -27,8 +27,9 @@ const (
 
 // HostHandler handles reverse JSON-RPC requests sent from the ACP agent to the client.
 type HostHandler struct {
-	cfg    config.ACPConfig
-	logger *slog.Logger
+	hostCtx context.Context
+	cfg     config.ACPConfig
+	logger  *slog.Logger
 
 	termSeq   atomic.Int64
 	termMu    sync.Mutex
@@ -82,10 +83,18 @@ func (t *managedTerminal) snapshot() (string, bool, *TerminalExitStatus) {
 }
 
 func NewHostHandler(cfg config.ACPConfig, logger *slog.Logger) *HostHandler {
+	return NewHostHandlerWithContext(context.Background(), cfg, logger)
+}
+
+func NewHostHandlerWithContext(hostCtx context.Context, cfg config.ACPConfig, logger *slog.Logger) *HostHandler {
+	if hostCtx == nil {
+		hostCtx = context.Background()
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &HostHandler{
+		hostCtx:   hostCtx,
 		cfg:       cfg,
 		logger:    logger,
 		terminals: make(map[string]*managedTerminal),
@@ -102,7 +111,7 @@ func (h *HostHandler) Handle(ctx context.Context, method string, params json.Raw
 	case "fs/write_text_file":
 		return h.handleFSWrite(params)
 	case "terminal/create":
-		return h.handleTerminalCreate(ctx, params)
+		return h.handleTerminalCreate(h.hostCtx, params)
 	case "terminal/output":
 		return h.handleTerminalOutput(params)
 	case "terminal/wait_for_exit":

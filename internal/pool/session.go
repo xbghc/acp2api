@@ -21,15 +21,17 @@ type acpWorker struct {
 // ManagedSession tracks an initialized ACP session either waiting in the pre-warmed idle pool,
 // checked out for an active turn, or stored in the multi-turn conversation cache.
 type ManagedSession struct {
-	ID           string
-	Worker       *acpWorker
-	Meta         acp.SessionNewResult
-	CurrentModel string
-	HistoryHash  string
-	SessionHint  string
-	TurnCount    int
-	CreatedAt    time.Time
-	LastUsedAt   time.Time
+	ID              string
+	Worker          *acpWorker
+	Meta            acp.SessionNewResult
+	CurrentModel    string
+	CurrentMode     string
+	CurrentThinking string
+	HistoryHash     string
+	SessionHint     string
+	TurnCount       int
+	CreatedAt       time.Time
+	LastUsedAt      time.Time
 }
 
 // Stats provides real-time observability into the process pool and session pools.
@@ -44,6 +46,7 @@ type Stats struct {
 	TotalRequests       int64 `json:"total_requests"`
 	IdlePoolHits        int64 `json:"idle_pool_hits"`
 	ConversationHits    int64 `json:"conversation_reuse_hits"`
+	SessionForkHits     int64 `json:"session_fork_hits"`
 	ColdCreations       int64 `json:"cold_session_creations"`
 	WorkerRestarts      int64 `json:"worker_restarts"`
 }

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"acp2api/internal/acp"
 	"acp2api/internal/bridge"
 )
 
@@ -22,7 +23,14 @@ type anthropicMessagesRequest struct {
 	Tools         []anthropicTool    `json:"tools,omitempty"`
 	ToolChoice    json.RawMessage    `json:"tool_choice,omitempty"`
 	StopSequences []string           `json:"stop_sequences,omitempty"`
-	Metadata      *struct {
+	Thinking      *struct {
+		Type         string `json:"type"`                    // "enabled", "adaptive", "disabled"
+		BudgetTokens int    `json:"budget_tokens,omitempty"` // optional token budget
+	} `json:"thinking,omitempty"`
+	OutputConfig *struct {
+		Effort string `json:"effort,omitempty"` // "low", "medium", "high", "max"
+	} `json:"output_config,omitempty"`
+	Metadata *struct {
 		UserID string `json:"user_id,omitempty"`
 	} `json:"metadata,omitempty"`
 }
@@ -43,6 +51,7 @@ type anthropicContentBlock struct {
 	Text      string          `json:"text,omitempty"`
 	Thinking  string          `json:"thinking,omitempty"`
 	Signature string          `json:"signature,omitempty"`
+	Title     string          `json:"title,omitempty"`
 	ID        string          `json:"id,omitempty"`
 	Name      string          `json:"name,omitempty"`
 	Input     json.RawMessage `json:"input,omitempty"`
@@ -50,11 +59,22 @@ type anthropicContentBlock struct {
 	Content   json.RawMessage `json:"content,omitempty"`
 	IsError   bool            `json:"is_error,omitempty"`
 	Source    *struct {
-		Type      string `json:"type"` // "base64" or "url"
+		Type      string `json:"type"` // "base64", "url", or "text"
 		MediaType string `json:"media_type"`
 		Data      string `json:"data"`
 		URL       string `json:"url"`
 	} `json:"source,omitempty"`
+}
+
+func classifyTurnErrorAnthropic(err error) (int, string) {
+	switch {
+	case errors.Is(err, acp.ErrUnsupportedThinkingLevel):
+		return http.StatusBadRequest, "invalid_request_error"
+	case errors.Is(err, context.DeadlineExceeded):
+		return http.StatusGatewayTimeout, "api_error"
+	default:
+		return http.StatusBadGateway, "api_error"
+	}
 }
 
 func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
@@ -84,17 +104,17 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 
 	resp, err := s.pool.ExecuteTurn(ctx, uReq, nil)
 	if err != nil {
-		status := http.StatusBadGateway
-		if errors.Is(err, context.DeadlineExceeded) {
-			status = http.StatusGatewayTimeout
-		}
-		writeAnthropicError(w, status, "api_error", err.Error())
+		status, errType := classifyTurnErrorAnthropic(err)
+		writeAnthropicError(w, status, errType, err.Error())
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-ACP-Session-ID", resp.SessionID)
 	w.Header().Set("X-ACP-Session-Reused", strconv.FormatBool(resp.SessionReused))
+	if resp.ThinkingStrategy != "" && resp.ThinkingStrategy != "none" {
+		w.Header().Set("X-ACP-Thinking-Strategy", resp.ThinkingStrategy)
+	}
 
 	var contentBlocks []map[string]any
 	if resp.Thinking != "" {
@@ -170,6 +190,9 @@ func (s *Server) serveAnthropicStream(ctx context.Context, w http.ResponseWriter
 
 	msgID := newShortID("msg_")
 	_, displayModel := s.cfg.ResolveModel(uReq.Model)
+	if strings.TrimSpace(uReq.Model) != "" {
+		displayModel = strings.TrimSpace(uReq.Model)
+	}
 	estInput := bridge.EstimateRequestTokens(uReq)
 
 	headersSent := false
@@ -320,11 +343,8 @@ func (s *Server) serveAnthropicStream(ctx context.Context, w http.ResponseWriter
 
 	if err != nil {
 		if !headersSent {
-			status := http.StatusBadGateway
-			if errors.Is(err, context.DeadlineExceeded) {
-				status = http.StatusGatewayTimeout
-			}
-			writeAnthropicError(w, status, "api_error", err.Error())
+			status, errType := classifyTurnErrorAnthropic(err)
+			writeAnthropicError(w, status, errType, err.Error())
 			return
 		}
 		closeActiveBlock()
@@ -341,7 +361,6 @@ func (s *Server) serveAnthropicStream(ctx context.Context, w http.ResponseWriter
 	ensureStarted()
 	closeActiveBlock()
 
-	// Ensure at least one block was emitted so strict Anthropic SDK stream accumulators succeed on empty responses.
 	if nextBlockIdx == 0 {
 		writeSSE("content_block_start", map[string]any{
 			"type":  "content_block_start",
@@ -417,15 +436,41 @@ func convertAnthropicRequest(raw *anthropicMessagesRequest, r *http.Request) (*b
 	}
 
 	return &bridge.UnifiedRequest{
-		Model:         raw.Model,
-		SessionHint:   resolveSessionHint(r, userHint),
-		System:        sysText,
-		Messages:      msgs,
-		Tools:         tools,
-		ToolChoice:    parseAnthropicToolChoice(raw.ToolChoice),
-		Stream:        raw.Stream,
-		StopSequences: raw.StopSequences,
+		Model:           raw.Model,
+		SessionHint:     resolveSessionHint(r, userHint),
+		ResumeSessionID: resolveResumeSessionID(r),
+		Mode:            resolveACPMode(r),
+		Thinking:        parseAnthropicThinkingIntent(raw),
+		System:          sysText,
+		Messages:        msgs,
+		Tools:           tools,
+		ToolChoice:      parseAnthropicToolChoice(raw.ToolChoice),
+		Stream:          raw.Stream,
+		StopSequences:   raw.StopSequences,
 	}, nil
+}
+
+func parseAnthropicThinkingIntent(raw *anthropicMessagesRequest) acp.DesiredThinking {
+	var enabled *bool
+	effort := ""
+	budget := 0
+
+	if raw.Thinking != nil {
+		switch strings.ToLower(strings.TrimSpace(raw.Thinking.Type)) {
+		case "disabled":
+			f := false
+			enabled = &f
+			effort = "none"
+		case "enabled", "adaptive":
+			t := true
+			enabled = &t
+			budget = raw.Thinking.BudgetTokens
+		}
+	}
+	if raw.OutputConfig != nil && strings.TrimSpace(raw.OutputConfig.Effort) != "" {
+		effort = raw.OutputConfig.Effort
+	}
+	return acp.NormalizeThinkingIntent(enabled, effort, budget)
 }
 
 func parseAnthropicSystem(raw json.RawMessage) (string, error) {
@@ -499,6 +544,30 @@ func parseAnthropicMessageContent(raw json.RawMessage) ([]bridge.ContentPart, er
 					img.Data = b.Source.Data
 				}
 				out = append(out, bridge.ContentPart{Kind: bridge.PartImage, Image: &img})
+			}
+
+		case "document":
+			if b.Source != nil {
+				uri := b.Source.URL
+				if uri == "" {
+					if b.Title != "" {
+						uri = "file:///" + b.Title
+					} else {
+						uri = "file:///document"
+					}
+				}
+				res := bridge.ResourcePayload{
+					URI:      uri,
+					Name:     b.Title,
+					MimeType: b.Source.MediaType,
+				}
+				switch b.Source.Type {
+				case "text":
+					res.Text = b.Source.Data
+				case "base64":
+					res.Blob = b.Source.Data
+				}
+				out = append(out, bridge.ContentPart{Kind: bridge.PartResource, Resource: &res})
 			}
 
 		case "tool_use":

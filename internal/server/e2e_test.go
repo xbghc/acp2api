@@ -157,7 +157,7 @@ func runMockACPStdioAgent() {
 						if st, ok := sessions.Load(p.SessionID); ok {
 							ms := st.(*mockSessState)
 							ms.mu.Lock()
-							ms.model = p.Value
+							ms.model = fmt.Sprint(p.Value)
 							ms.mu.Unlock()
 						}
 						writeLine(map[string]any{
@@ -270,6 +270,10 @@ func runMockACPStdioAgent() {
 								"terminalId": tcr.TerminalID,
 							})
 							emitChunk("agent_message_chunk", "TERM="+tor.Output)
+						} else if strings.Contains(txt, "INLINE_THINK_TEST") {
+							// Simulate non-standard ACP server that streams <think>...</think> inside agent_message_chunk without agent_thought_chunk!
+							emitChunk("agent_message_chunk", "<think>inline reasoning ")
+							emitChunk("agent_message_chunk", "step 2</think>\nClean visible answer")
 						} else if strings.Contains(txt, "CALL_WEATHER_TOOL") && !strings.Contains(txt, "<tool_response tool_call_id=") {
 							emitChunk("agent_thought_chunk", "Need to call get_weather tool.")
 							emitChunk("agent_message_chunk", "<tool_")
@@ -783,5 +787,77 @@ func TestConcurrentBurstAndConversationForking(t *testing.T) {
 	statsResp, _ := doJSON(t, "GET", ts.URL+"/v1/pool/stats", "test-secret-key", nil)
 	if statsResp.StatusCode != http.StatusOK || p.Stats().TotalRequests < 15 {
 		t.Fatalf("unexpected pool stats: %+v", p.Stats())
+	}
+}
+
+func TestThinkingFallbackInlineThinkExtractionAndRichMedia(t *testing.T) {
+	// Mock server has NO thought_level configOption -> verifies fallback_meta + inline <think> extraction!
+	ts, _ := newTestGateway(t, nil)
+
+	// 1. OpenAI request with model:high suffix + input_audio + file + INLINE_THINK_TEST
+	resp1, raw1 := doJSON(t, "POST", ts.URL+"/v1/chat/completions", "test-secret-key", map[string]any{
+		"model": "acp-fast-v1:high",
+		"messages": []map[string]any{
+			{
+				"role": "user",
+				"content": []map[string]any{
+					{"type": "text", "text": "INLINE_THINK_TEST"},
+					{"type": "input_audio", "input_audio": map[string]any{"data": "UklGRg==", "format": "mp3"}},
+					{"type": "file", "file": map[string]any{"filename": "doc.txt", "file_data": "data:text/plain;base64,SGVsbG8="}},
+				},
+			},
+		},
+	})
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("INLINE_THINK_TEST failed: %d %s", resp1.StatusCode, string(raw1))
+	}
+	if gotStrat := resp1.Header.Get("X-ACP-Thinking-Strategy"); gotStrat != "fallback_meta" {
+		t.Fatalf("expected X-ACP-Thinking-Strategy=fallback_meta, got %q", gotStrat)
+	}
+	var chat1 struct {
+		Choices []struct {
+			Message struct {
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	_ = json.Unmarshal(raw1, &chat1)
+	if chat1.Choices[0].Message.ReasoningContent != "inline reasoning step 2" || chat1.Choices[0].Message.Content != "Clean visible answer" {
+		t.Fatalf("unexpected inline think split: %+v", chat1.Choices[0].Message)
+	}
+
+	// 2. Anthropic request with thinking={type:"disabled"} -> suppresses thinking output even if agent emits thoughts!
+	respDisabled, rawDisabled := doJSON(t, "POST", ts.URL+"/v1/messages", "test-secret-key", map[string]any{
+		"model":      "acp-fast-v1",
+		"max_tokens": 256,
+		"thinking":   map[string]any{"type": "disabled"},
+		"messages": []map[string]any{
+			{
+				"role": "user",
+				"content": []map[string]any{
+					{"type": "text", "text": "Hello with doc"},
+					{"type": "document", "title": "readme.md", "source": map[string]any{"type": "text", "media_type": "text/markdown", "data": "# Doc"}},
+				},
+			},
+		},
+	})
+	if respDisabled.StatusCode != http.StatusOK || strings.Contains(string(rawDisabled), `"type":"thinking"`) {
+		t.Fatalf("expected thinking block suppressed when thinking.type=disabled: %d %s", respDisabled.StatusCode, string(rawDisabled))
+	}
+
+	// 3. StrictError thinking fallback policy returns HTTP 400 when ACP agent has no thinking level selector!
+	tsStrict, _ := newTestGateway(t, func(c *config.Config) {
+		c.ACP.Thinking.FallbackStrategy = config.ThinkingFallbackStrictError
+	})
+	respStrict, rawStrict := doJSON(t, "POST", tsStrict.URL+"/v1/messages", "test-secret-key", map[string]any{
+		"model":         "acp-fast-v1",
+		"max_tokens":    256,
+		"thinking":      map[string]any{"type": "enabled", "budget_tokens": 16000},
+		"output_config": map[string]any{"effort": "high"},
+		"messages":      []map[string]any{{"role": "user", "content": "hi"}},
+	})
+	if respStrict.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request under strict_error policy, got %d %s", respStrict.StatusCode, string(rawStrict))
 	}
 }
